@@ -1,0 +1,117 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "lsm-db"
+version = "0.2.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Log-structured merge-tree storage engine for Rust. Memtable, leveled SSTables, background compaction, and bloom-filtered point reads over a durable wal-db log. A composable storage engine for embedded databases and Hive DB."
+
+# Keywords (5 max)
+keywords = [
+    "lsm-tree",
+    "storage-engine",
+    "database",
+    "compaction",
+    "key-value"
+]
+
+# Categories
+categories = [
+    "database-implementations",
+    "data-structures",
+    "filesystem"
+]
+
+# Links
+homepage      = "https://github.com/jamesgober/lsm-db"
+repository    = "https://github.com/jamesgober/lsm-db"
+documentation = "https://docs.rs/lsm-db"
+
+# Authors
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "lsm_db"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+# Standard library.
+std = []
+# Crash-safe memtable durability via `wal-db`.
+durability = ["dep:wal-db"]
+# Bloom-filtered SSTable point lookups.
+bloom = ["dep:bloom-lib"]
+# On-disk record framing via `pack-io`.
+framing = ["dep:pack-io"]
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# Domain error type. Portfolio crates standardise on `error-forge` for stable
+# error metadata (kind/caption/is_fatal) instead of thiserror/anyhow. Default
+# features are off — only the `ForgeError` trait is needed.
+error-forge = { version = "1.0", default-features = false }
+
+# First-party primitives, each behind its own additive feature flag. They are
+# wired here so the public surface and CI matrix stay stable as the matching
+# milestones land them: durability (0.4), framing (0.4), bloom (0.5).
+wal-db    = { version = "1.0", optional = true, default-features = false }
+bloom-lib = { version = "1.0", optional = true, default-features = false }
+pack-io   = { version = "1.0", optional = true, default-features = false }
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+tempfile  = "3"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "lsm_bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
