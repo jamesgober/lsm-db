@@ -17,9 +17,11 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.2.0`).** The Tier-1 surface below is implemented and
-> stable in shape. Sections marked _(planned)_ describe surface that lands later
-> in the 0.x series. The on-disk format is not yet frozen.
+> **Status: pre-1.0 (`0.3.0`).** The Tier-1 surface below is implemented and
+> stable in shape, over a multi-run engine with background compaction. The
+> on-disk format is frozen for the 1.x series
+> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). Sections marked _(planned)_
+> describe surface that lands later in the 0.x series.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -47,6 +49,7 @@
     - [`Lsm::flush`](#lsmflush)
   - [`LsmConfig`](#lsmconfig)
   - [`DEFAULT_MEMTABLE_CAPACITY`](#default_memtable_capacity)
+  - [`DEFAULT_COMPACTION_TRIGGER`](#default_compaction_trigger)
   - [`Batch`](#batch)
   - [`Scan`](#scan)
   - [`Error` & `Result`](#error--result)
@@ -414,25 +417,39 @@ Tier-2 tuning parameters, passed to [`Lsm::open_with`](#lsmopen_with). Build wit
 | Method | Description |
 |--------|-------------|
 | `LsmConfig::new() -> LsmConfig` | Start from the default configuration. |
-| `LsmConfig::default() -> LsmConfig` | Same as `new`; a [`DEFAULT_MEMTABLE_CAPACITY`](#default_memtable_capacity) buffer. |
+| `LsmConfig::default() -> LsmConfig` | Same as `new`; default buffer and compaction trigger. |
 | `.memtable_capacity(bytes: usize) -> LsmConfig` | Set the write-buffer size, in bytes of live key + value data. Consumes and returns `self`. |
 | `.memtable_capacity_bytes(&self) -> usize` | Read the configured capacity. |
+| `.compaction_trigger(runs: usize) -> LsmConfig` | Set the run count that triggers a background compaction. Values below `2` become `2`. Consumes and returns `self`. |
+| `.compaction_trigger_runs(&self) -> usize` | Read the configured trigger. |
 
 The capacity counts key and value bytes only, not per-entry bookkeeping, so peak
 resident memory is somewhat higher than the configured number. A capacity of `0`
 flushes after every write — useful in tests, rarely otherwise.
 
+The compaction trigger bounds read amplification: each flush adds a run, and a
+point read may consult every run, so the engine merges the runs into one in the
+background once there are this many. Smaller values keep reads fast at the cost
+of more compaction work.
+
 ```rust
 use lsm_db::LsmConfig;
 
-// 1 MiB write buffer.
-let config = LsmConfig::new().memtable_capacity(1 << 20);
+// 1 MiB write buffer; compact once eight runs pile up.
+let config = LsmConfig::new()
+    .memtable_capacity(1 << 20)
+    .compaction_trigger(8);
 assert_eq!(config.memtable_capacity_bytes(), 1 << 20);
+assert_eq!(config.compaction_trigger_runs(), 8);
 
-// The default.
+// The defaults.
 assert_eq!(
     LsmConfig::default().memtable_capacity_bytes(),
     lsm_db::DEFAULT_MEMTABLE_CAPACITY,
+);
+assert_eq!(
+    LsmConfig::default().compaction_trigger_runs(),
+    lsm_db::DEFAULT_COMPACTION_TRIGGER,
 );
 ```
 
@@ -448,6 +465,20 @@ The memtable capacity used by [`LsmConfig::default`] and [`Lsm::open`](#lsmopen)
 
 ```rust
 assert_eq!(lsm_db::DEFAULT_MEMTABLE_CAPACITY, 4 * 1024 * 1024);
+```
+
+---
+
+### `DEFAULT_COMPACTION_TRIGGER`
+
+```rust
+pub const DEFAULT_COMPACTION_TRIGGER: usize = 4; // runs
+```
+
+The run count that triggers a background compaction by default.
+
+```rust
+assert_eq!(lsm_db::DEFAULT_COMPACTION_TRIGGER, 4);
 ```
 
 ---
@@ -610,7 +641,10 @@ fn main() -> Result<()> {
 wrapped in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) and
 used from many threads. Reads proceed in parallel; writes are serialized;
 [`scan`](#lsmscan) returns a consistent snapshot and never blocks writers for
-the duration of iteration.
+the duration of iteration. A background thread compacts runs as they accumulate;
+its expensive merge runs with no lock held, taking the engine lock only to swap
+the finished run in, so it does not block reads or writes for the merge. Dropping
+the `Lsm` stops and joins that thread.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -640,13 +674,19 @@ assert_eq!(db.scan(..)?.count(), 100);
 
 ## Durability & persistence
 
-In `0.2`, data becomes durable when it is flushed: [`flush`](#lsmflush), or an
-automatic flush when the buffer reaches its [capacity](#lsmconfig). A flush
-writes the new run to a temporary file, `fsync`s it, and atomically renames it
-into place, so a crash leaves either the old run or the new one — never a torn
-file. Writes still buffered in memory when a process exits without flushing are
-**not** yet crash-safe; write-ahead logging arrives under the `durability`
-feature in `0.4`. The on-disk format is not frozen until `0.3`.
+Data becomes durable when it is flushed: [`flush`](#lsmflush), or an automatic
+flush when the buffer reaches its [capacity](#lsmconfig). A flush writes a new
+run to a temporary file, `fsync`s it, atomically renames it into place, and
+records it in the manifest — also written atomically. Compaction installs its
+merged run the same way. The manifest is the source of truth for the live run
+set, so a crash mid-flush or mid-compaction recovers cleanly: on open, temporary
+files and run files the manifest does not name are reclaimed as orphans. The
+byte-level format is frozen for 1.x and specified in
+[`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md).
+
+Writes still buffered in memory when a process exits without flushing are **not**
+yet crash-safe; write-ahead logging arrives under the `durability` feature in a
+later release.
 
 ---
 

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -58,6 +58,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "lsm_db"
 path = "src/lib.rs"
 
+# `loom` is a custom cfg set via `RUSTFLAGS="--cfg loom"` for the concurrency
+# model checks; it is declared here to satisfy the `unexpected_cfgs` lint under
+# `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 
 # FEATURE FLAGS
 # #################################
@@ -80,6 +86,13 @@ framing = ["dep:pack-io"]
 # error metadata (kind/caption/is_fatal) instead of thiserror/anyhow. Default
 # features are off — only the `ForgeError` trait is needed.
 error-forge = { version = "1.0", default-features = false }
+
+# Hardware-accelerated CRC32C (Castagnoli) for sorted-run integrity: per-block
+# and index checksums in the on-disk format. Uses the SSE4.2 `crc32` instruction
+# on x86_64 and the CRC extension on aarch64, with a software fallback. Same
+# choice as `wal-db`; rolling it by hand would re-implement the intrinsics with
+# no upside.
+crc32c = "0.6"
 
 # First-party primitives, each behind its own additive feature flag. They are
 # wired here so the public surface and CI matrix stay stable as the matching

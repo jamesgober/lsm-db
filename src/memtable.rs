@@ -12,29 +12,7 @@
 
 use std::collections::{BTreeMap, btree_map};
 
-/// What a key currently maps to in the write buffer.
-///
-/// A `Value` is live data. A `Tombstone` records that the key has been deleted:
-/// it must shadow any value the key still has in an on-disk run until a flush
-/// resolves the two, at which point the key is simply omitted from the new run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Record {
-    /// The key maps to this value.
-    Value(Vec<u8>),
-    /// The key has been deleted; mask any older on-disk value.
-    Tombstone,
-}
-
-impl Record {
-    /// The number of value bytes this record holds (zero for a tombstone).
-    #[inline]
-    fn value_len(&self) -> usize {
-        match self {
-            Record::Value(v) => v.len(),
-            Record::Tombstone => 0,
-        }
-    }
-}
+use crate::record::Record;
 
 /// A sorted, in-memory buffer of the most recent write per key.
 #[derive(Debug, Default)]

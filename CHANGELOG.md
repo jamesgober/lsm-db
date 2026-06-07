@@ -18,6 +18,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.3.0] - 2026-06-06
+
+The real engine: multiple on-disk runs, background compaction, and a frozen
+on-disk format. Flushes now append a new sorted run rather than rewriting a
+single one; a background thread merges runs into one when they accumulate, so
+read amplification stays bounded; and reads merge across the memtable and every
+run, newest first. A manifest records the live run set, so a crash mid-flush or
+mid-compaction recovers to a consistent state.
+
+The on-disk sorted-run format is **frozen for the 1.x series** and specified
+byte-for-byte in `docs/SSTABLE_FORMAT.md`.
+
+The public API is unchanged from 0.2 except for additive configuration.
+
+### Added
+
+- Multi-run storage: each flush writes a new immutable sorted run; reads and
+  scans merge across the memtable and all runs with a newest-wins, tombstone-
+  aware k-way merge.
+- Background compaction: a dedicated thread merges the runs into one when their
+  count reaches the configured trigger, concurrent with reads and writes, and
+  reclaims superseded run files once no reader still holds them.
+- `LsmConfig::compaction_trigger` / `compaction_trigger_runs`, and the
+  `DEFAULT_COMPACTION_TRIGGER` constant (4 runs).
+- Frozen, block-structured on-disk run format (v1): data blocks with a block
+  index, per-block and per-index CRC32C integrity, and tombstones on disk.
+  Specified in `docs/SSTABLE_FORMAT.md`.
+- On-disk `MANIFEST` recording the live runs in recency order plus the next run
+  sequence number; rewritten atomically on every flush and compaction.
+- Crash recovery on open: the manifest is the source of truth; temporary files
+  and run files it does not name are reclaimed as orphans.
+- `crc32c` dependency for hardware-accelerated run checksums.
+- Tests: property test of compaction against a model; concurrent-writer stress
+  test with background compaction; crash-recovery tests (ungraceful exit, stale
+  temp file, orphan run, missing run, corrupted block); `loom` model of the
+  read-versus-compaction swap protocol.
+
+### Changed
+
+- Flush no longer merges into a single run; it appends a new run and lets
+  compaction consolidate. The on-disk layout from 0.2 (which was explicitly not
+  frozen) is replaced by the v1 format; 0.2 data directories are not read.
+
+---
+
 ## [0.2.0] - 2026-06-06
 
 The foundation release: a working single-run storage engine with the Tier-1 API
@@ -80,6 +125,7 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/lsm-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lsm-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lsm-db/releases/tag/v0.1.0

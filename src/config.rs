@@ -12,6 +12,14 @@
 /// every handful of writes. Tune with [`LsmConfig::memtable_capacity`].
 pub const DEFAULT_MEMTABLE_CAPACITY: usize = 4 * 1024 * 1024;
 
+/// Default number of on-disk runs that triggers a background compaction.
+///
+/// Each flush adds a run, and every point read may have to consult each run, so
+/// the run count bounds read amplification. When it reaches this many, the
+/// background compactor merges the runs into one. Tune with
+/// [`LsmConfig::compaction_trigger`].
+pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
+
 /// Tuning parameters for an [`Lsm`](crate::Lsm) engine.
 ///
 /// Construct with [`LsmConfig::new`] (or [`LsmConfig::default`]) and refine with
@@ -29,6 +37,7 @@ pub const DEFAULT_MEMTABLE_CAPACITY: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsmConfig {
     memtable_capacity: usize,
+    compaction_trigger: usize,
 }
 
 impl LsmConfig {
@@ -89,13 +98,54 @@ impl LsmConfig {
     pub fn memtable_capacity_bytes(&self) -> usize {
         self.memtable_capacity
     }
+
+    /// Set the number of on-disk runs that triggers a background compaction.
+    ///
+    /// Reads may consult every run, so this bounds read amplification: the
+    /// engine keeps at most roughly this many runs before merging them into one
+    /// in the background. Smaller values keep reads fast at the cost of more
+    /// compaction work; larger values do the reverse. Values below `2` are
+    /// treated as `2`, since merging a single run is pointless.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_db::LsmConfig;
+    /// let config = LsmConfig::new().compaction_trigger(8);
+    /// assert_eq!(config.compaction_trigger_runs(), 8);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn compaction_trigger(mut self, runs: usize) -> Self {
+        self.compaction_trigger = runs.max(2);
+        self
+    }
+
+    /// The configured compaction trigger, in number of runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_db::LsmConfig;
+    /// assert_eq!(
+    ///     LsmConfig::default().compaction_trigger_runs(),
+    ///     lsm_db::DEFAULT_COMPACTION_TRIGGER,
+    /// );
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn compaction_trigger_runs(&self) -> usize {
+        self.compaction_trigger
+    }
 }
 
 impl Default for LsmConfig {
-    /// The default configuration: a [`DEFAULT_MEMTABLE_CAPACITY`] write buffer.
+    /// The default configuration: a [`DEFAULT_MEMTABLE_CAPACITY`] write buffer
+    /// and a [`DEFAULT_COMPACTION_TRIGGER`] run threshold.
     fn default() -> Self {
         LsmConfig {
             memtable_capacity: DEFAULT_MEMTABLE_CAPACITY,
+            compaction_trigger: DEFAULT_COMPACTION_TRIGGER,
         }
     }
 }
@@ -122,5 +172,39 @@ mod tests {
     #[test]
     fn test_new_equals_default() {
         assert_eq!(LsmConfig::new(), LsmConfig::default());
+    }
+
+    #[test]
+    fn test_default_compaction_trigger_is_documented_constant() {
+        assert_eq!(
+            LsmConfig::default().compaction_trigger_runs(),
+            DEFAULT_COMPACTION_TRIGGER
+        );
+    }
+
+    #[test]
+    fn test_compaction_trigger_override() {
+        assert_eq!(
+            LsmConfig::new()
+                .compaction_trigger(8)
+                .compaction_trigger_runs(),
+            8
+        );
+    }
+
+    #[test]
+    fn test_compaction_trigger_clamped_to_two() {
+        assert_eq!(
+            LsmConfig::new()
+                .compaction_trigger(0)
+                .compaction_trigger_runs(),
+            2
+        );
+        assert_eq!(
+            LsmConfig::new()
+                .compaction_trigger(1)
+                .compaction_trigger_runs(),
+            2
+        );
     }
 }

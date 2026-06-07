@@ -104,7 +104,13 @@ mod db;
 #[cfg(feature = "std")]
 mod error;
 #[cfg(feature = "std")]
+mod manifest;
+#[cfg(feature = "std")]
 mod memtable;
+#[cfg(feature = "std")]
+mod merge;
+#[cfg(feature = "std")]
+mod record;
 #[cfg(feature = "std")]
 mod scan;
 #[cfg(feature = "std")]
@@ -113,7 +119,7 @@ mod sstable;
 #[cfg(feature = "std")]
 pub use crate::batch::Batch;
 #[cfg(feature = "std")]
-pub use crate::config::{DEFAULT_MEMTABLE_CAPACITY, LsmConfig};
+pub use crate::config::{DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_CAPACITY, LsmConfig};
 #[cfg(feature = "std")]
 pub use crate::db::Lsm;
 #[cfg(feature = "std")]
