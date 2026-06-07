@@ -63,21 +63,21 @@
 //!
 //! ## Durability
 //!
-//! This release (`0.2`) flushes complete runs to disk and `fsync`s them, so
-//! flushed data survives reopening. Writes still in the buffer when a process
-//! exits without [`flush`](Lsm::flush)ing are not yet crash-safe; write-ahead
-//! logging arrives under the `durability` feature in a later release. The
-//! on-disk format is not yet frozen — it is finalised when the multi-level
-//! engine lands in `0.3`.
+//! Flushed runs are `fsync`ed and recorded in a manifest, so flushed data
+//! survives reopening, and the on-disk format is frozen for the 1.x series.
+//! Writes still buffered in the memtable when a process exits without
+//! [`flush`](Lsm::flush)ing are durable only with the `durability` feature: it
+//! logs every write to a `wal-db` write-ahead log before acknowledging it and
+//! replays the log on open, so no acknowledged write is lost across a crash.
 //!
 //! ## Feature flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
 //! | `std` | yes | Standard library. The engine requires it. |
-//! | `durability` | no | Crash-safe memtable durability via `wal-db` (planned). |
+//! | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. |
 //! | `bloom` | no | Bloom-filtered point lookups via `bloom-lib` (planned). |
-//! | `framing` | no | On-disk record framing via `pack-io` (planned). |
+//! | `framing` | no | Typed on-disk record framing via `pack-io` (planned). |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -101,6 +101,8 @@ mod batch;
 mod config;
 #[cfg(feature = "std")]
 mod db;
+#[cfg(feature = "std")]
+mod durability;
 #[cfg(feature = "std")]
 mod error;
 #[cfg(feature = "std")]

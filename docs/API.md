@@ -17,11 +17,11 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.3.0`).** The Tier-1 surface below is implemented and
-> stable in shape, over a multi-run engine with background compaction. The
-> on-disk format is frozen for the 1.x series
-> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). Sections marked _(planned)_
-> describe surface that lands later in the 0.x series.
+> **Status: pre-1.0 (`0.4.0`).** The Tier-1 surface below is implemented and
+> stable in shape, over a multi-run engine with background compaction and
+> optional crash-safe writes (the `durability` feature). The on-disk format is
+> frozen for the 1.x series ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)).
+> Sections marked _(planned)_ describe surface that lands later in the 0.x series.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -684,9 +684,43 @@ files and run files the manifest does not name are reclaimed as orphans. The
 byte-level format is frozen for 1.x and specified in
 [`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md).
 
-Writes still buffered in memory when a process exits without flushing are **not**
-yet crash-safe; write-ahead logging arrives under the `durability` feature in a
-later release.
+### Crash-safe writes (`durability` feature)
+
+By default, writes are durable once flushed; a write still buffered in the
+memtable when the process exits is lost. Enable the `durability` feature to close
+that gap:
+
+```toml
+[dependencies]
+lsm-db = { version = "0.4", features = ["durability"] }
+```
+
+With it on, every `put` / `delete` / `write` is appended to a `wal-db`
+write-ahead log and `fsync`ed **before** it is acknowledged, and a batch is
+logged as one atomic record. On open, the log is replayed into the memtable and
+checkpointed to a run, so no acknowledged write is lost across a crash — even one
+before the next flush. The log holds only the writes since the last flush; a
+flush empties it. The public API is identical either way, so the same code runs
+durably or not depending on the feature:
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+{
+    let db = lsm_db::Lsm::open(dir.path())?;
+    db.put(b"k", b"v")?;   // logged + fsynced before returning (with `durability`)
+    // ...process exits here without an explicit flush...
+}
+// Reopen: the write is recovered from the log.
+let db = lsm_db::Lsm::open(dir.path())?;
+assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+# Ok(())
+# }
+```
+
+The durable write path is currently serial — each write holds the engine lock
+across its `fsync` — so it trades throughput for the guarantee; batched group
+commit is a later optimisation.
 
 ---
 
@@ -695,9 +729,9 @@ later release.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | yes | Standard library. The engine requires it. |
-| `durability` | no | Crash-safe memtable durability via `wal-db`. _(planned: 0.4)_ |
+| `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. See [above](#crash-safe-writes-durability-feature). |
 | `bloom` | no | Bloom-filtered point lookups via `bloom-lib`. _(planned: 0.5)_ |
-| `framing` | no | On-disk record framing via `pack-io`. _(planned: 0.4)_ |
+| `framing` | no | Typed on-disk record framing via `pack-io`. _(planned)_ |
 
 All features are additive: enabling one never removes functionality.
 

@@ -33,14 +33,11 @@ impl MemTable {
         }
     }
 
-    /// Record that `key` maps to `value`, replacing any previous record.
-    pub(crate) fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.insert(key, Record::Value(value));
-    }
-
-    /// Record that `key` has been deleted, replacing any previous record.
-    pub(crate) fn delete(&mut self, key: Vec<u8>) {
-        self.insert(key, Record::Tombstone);
+    /// Apply a record (value or tombstone) for `key`, replacing any previous
+    /// record. This is the single mutation entry point: writes build the
+    /// [`Record`] once and hand the same value to the log and the buffer.
+    pub(crate) fn apply(&mut self, key: Vec<u8>, record: Record) {
+        self.insert(key, record);
     }
 
     /// Insert a record, keeping [`approx_size`](Self::approx_size) consistent.
@@ -102,6 +99,15 @@ impl MemTable {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    impl MemTable {
+        fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+            self.apply(key, Record::Value(value));
+        }
+        fn delete(&mut self, key: Vec<u8>) {
+            self.apply(key, Record::Tombstone);
+        }
+    }
 
     #[test]
     fn test_put_then_get_returns_value() {

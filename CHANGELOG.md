@@ -18,6 +18,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.0] - 2026-06-07
+
+Durability and crash recovery. Under the `durability` feature, every write is
+appended to a `wal-db` write-ahead log and made durable before it is
+acknowledged, and the log is replayed on open — so no acknowledged write is lost
+across a crash, even one before the next flush. The feature is additive: with it
+off, the engine behaves exactly as in 0.3 (durable on flush, fast for caches and
+tests).
+
+The public API is unchanged.
+
+### Added
+
+- `durability` feature: a `wal-db`-backed write-ahead log on the write path.
+  Each `put` / `delete` / `write` is logged and `fsync`ed before it is applied
+  and acknowledged; a batch is logged as one atomic record.
+- Crash recovery: on open with the feature enabled, the log is replayed into the
+  memtable and checkpointed to a run, so recovery only ever replays the writes
+  since the most recent flush. The log is emptied (rotated) after each flush.
+- Crash-recovery integration tests (under `--all-features`): un-flushed writes,
+  overwrites, deletes, and batches all survive a drop-without-flush and reopen;
+  recovery composes with mid-flush, orphan, and corruption handling from 0.3.
+
+### Changed
+
+- `wal-db` is now pulled (with default features off) by the `durability` feature.
+
+### Notes
+
+- `pack-io` record framing (the `framing` feature) is **deferred** — the
+  transient, reset-every-flush log gains little from schema-evolution framing,
+  and a feature-selected second on-disk codec is not cleanly covered by the
+  default / `--all-features` CI matrix. The durable path ships with a single,
+  fully-tested record codec. The `framing` flag remains declared as planned.
+- Durable writes are serial: each holds the engine write lock across its `fsync`,
+  so group commit gives no benefit yet. Batched group commit is an optimisation
+  for a later release.
+
+---
+
 ## [0.3.0] - 2026-06-06
 
 The real engine: multiple on-disk runs, background compaction, and a frozen
@@ -125,7 +165,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lsm-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lsm-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lsm-db/releases/tag/v0.1.0

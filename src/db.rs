@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Op};
 use crate::config::LsmConfig;
+use crate::durability::Durability;
 use crate::error::{Error, Result};
 use crate::manifest::{self, Manifest};
 use crate::memtable::MemTable;
@@ -41,6 +42,8 @@ struct Inner {
     memtable: MemTable,
     /// Live runs, newest first.
     runs: Vec<Arc<SsTable>>,
+    /// Write-ahead log (a no-op unless the `durability` feature is enabled).
+    durability: Durability,
 }
 
 /// Coordination state for the background compactor.
@@ -190,12 +193,19 @@ impl Lsm {
             }
         }
 
+        // Open the write-ahead log and replay any writes not yet flushed into a
+        // fresh memtable. With the `durability` feature off this is a no-op.
+        let durability = Durability::open(&dir)?;
+        let mut memtable = MemTable::new();
+        durability.replay(&mut memtable)?;
+
         let engine = Arc::new(Engine {
             dir,
             config,
             inner: RwLock::new(Inner {
-                memtable: MemTable::new(),
+                memtable,
                 runs,
+                durability,
             }),
             next_seq: AtomicU64::new(next_seq),
             compacting: AtomicBool::new(false),
@@ -203,6 +213,10 @@ impl Lsm {
             cond: Condvar::new(),
             last_error: Mutex::new(None),
         });
+
+        // Checkpoint recovered writes: persist them as a run and empty the log,
+        // so recovery only ever replays the writes since the most recent flush.
+        engine.flush()?;
 
         let compactor = {
             let engine = Arc::clone(&engine);
@@ -406,24 +420,40 @@ impl Drop for Lsm {
 
 impl Engine {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let record = Record::Value(value.to_vec());
         let mut inner = self.write_guard();
-        inner.memtable.put(key.to_vec(), value.to_vec());
+        // Durably log the write before it is acknowledged, then buffer it.
+        inner.durability.log_one(key, &record)?;
+        inner.memtable.apply(key.to_vec(), record);
         self.maybe_flush(&mut inner)
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
+        let record = Record::Tombstone;
         let mut inner = self.write_guard();
-        inner.memtable.delete(key.to_vec());
+        inner.durability.log_one(key, &record)?;
+        inner.memtable.apply(key.to_vec(), record);
         self.maybe_flush(&mut inner)
     }
 
     fn write(&self, batch: Batch) -> Result<()> {
+        let ops: Vec<(Vec<u8>, Record)> = batch
+            .into_ops()
+            .into_iter()
+            .map(|(key, op)| {
+                let record = match op {
+                    Op::Put(value) => Record::Value(value),
+                    Op::Delete => Record::Tombstone,
+                };
+                (key, record)
+            })
+            .collect();
+
         let mut inner = self.write_guard();
-        for (key, op) in batch.into_ops() {
-            match op {
-                Op::Put(value) => inner.memtable.put(key, value),
-                Op::Delete => inner.memtable.delete(key),
-            }
+        // The whole batch is logged as one record, so it is recovered atomically.
+        inner.durability.log_batch(&ops)?;
+        for (key, record) in ops {
+            inner.memtable.apply(key, record);
         }
         self.maybe_flush(&mut inner)
     }
@@ -517,6 +547,10 @@ impl Engine {
         let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
         Manifest::store(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
         inner.runs = new_runs;
+
+        // The flushed writes are now durable in the run, so the log that held
+        // them can be emptied; recovery replays only writes since this flush.
+        inner.durability.rotate()?;
 
         if inner.runs.len() >= self.config.compaction_trigger_runs() {
             self.signal_compaction();

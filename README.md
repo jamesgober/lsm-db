@@ -51,11 +51,11 @@
 - **Tombstone deletes** &mdash; deletes mask older values and resolve away during compaction
 - **Range scans** &mdash; merge the buffer and every run into one sorted stream
 - **Grouped writes** &mdash; apply a batch atomically with respect to concurrent readers
+- **Crash-safe writes** &mdash; under the `durability` feature, every write hits a `wal-db` log before acknowledgment and is replayed on open (no acknowledged write lost across a crash)
 - **Shared, thread-safe handle** &mdash; one engine, many threads, behind an `Arc`
 
 **On the roadmap:**
 
-- **Write-ahead logging** &mdash; crash-safe un-flushed writes via `wal-db`, under `durability` (`0.4`)
 - **Bloom filters** &mdash; skip runs that can't contain a key, under `bloom` (`0.5`)
 - **Pluggable comparator** &mdash; custom key ordering (`0.5`)
 
@@ -66,7 +66,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.3"
+lsm-db = "0.4"
+
+# Crash-safe writes via a write-ahead log:
+lsm-db = { version = "0.4", features = ["durability"] }
 ```
 
 <br>
@@ -109,7 +112,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.3.0</code> release: multiple on-disk runs, background compaction, and a frozen on-disk format, behind the same Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). Durability of un-flushed writes (write-ahead logging) and bloom-filtered reads land across the rest of the 0.x series per the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
+This is the <code>v0.4.0</code> release: multiple on-disk runs, background compaction, a frozen on-disk format, and crash-safe writes via a write-ahead log under the <code>durability</code> feature — behind the same Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). Bloom-filtered reads and a pluggable comparator land across the rest of the 0.x series per the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
 
 <hr>
 <br>
