@@ -17,13 +17,11 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.7.0`), feature-complete, API frozen.** The surface below
-> is frozen until 2.0 — no breaking change — over a multi-run engine with
-> background compaction, a block cache, optional crash-safe writes
-> (`durability`), and optional bloom-filtered point reads (`bloom`). The on-disk
-> format is frozen for the 1.x series
-> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). The remaining 0.x releases are
-> bug-fix and doc polish toward 1.0.
+> **Status: `1.0.0`, stable. API frozen until 2.0.** The surface below is frozen
+> — no breaking change — over a multi-run engine with background compaction, a
+> block cache, optional crash-safe writes (`durability`), and optional
+> bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x
+> series ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)).
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -67,7 +65,7 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.9"
+lsm-db = "1.0"
 ```
 
 The engine requires the standard library, which is on by default. See
@@ -796,7 +794,6 @@ assert_eq!(db.get(b"absent")?, None);
 | `std` | yes | Standard library. The engine requires it. |
 | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. See [above](#crash-safe-writes-durability-feature). |
 | `bloom` | no | Per-run bloom filters that skip runs on point reads. See [above](#bloom-filtered-reads-bloom-feature). |
-| `framing` | no | Typed on-disk record framing via `pack-io`. _(planned)_ |
 
 All features are additive: enabling one never removes functionality.
 

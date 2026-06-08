@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "0.9.5"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -77,8 +77,6 @@ durability = ["dep:wal-db"]
 # sidecar file via `postcard`) lets a point read skip any run that cannot
 # contain the key.
 bloom = ["dep:bloom-lib", "dep:postcard"]
-# On-disk record framing via `pack-io`.
-framing = ["dep:pack-io"]
 
 
 # DEPENDENCIES
@@ -96,14 +94,12 @@ error-forge = { version = "1.0", default-features = false }
 # no upside.
 crc32c = "0.6"
 
-# First-party primitives, each behind its own additive feature flag. They are
-# wired here so the public surface and CI matrix stay stable as the matching
-# milestones land them: durability (0.4), framing (0.4), bloom (0.5).
+# First-party primitives, each behind its own additive feature flag: durability
+# (0.4) and bloom (0.5). Optional so the default build pulls neither.
 wal-db    = { version = "1.0", optional = true, default-features = false }
 # `serde` so a built filter can be persisted to / loaded from its sidecar; the
 # default hasher is fixed-seed, so a reloaded filter answers identically.
 bloom-lib = { version = "1.0", optional = true, default-features = false, features = ["std", "serde"] }
-pack-io   = { version = "1.0", optional = true, default-features = false }
 
 # Compact, no_std, serde-based codec for the bloom-filter sidecar files. Pulled
 # only by the `bloom` feature.

@@ -18,6 +18,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.0.0] - 2026-06-08
+
+First stable release. The **public API is frozen until 2.0** and the on-disk
+format (sorted-run layout, manifest, bloom sidecar, and the `durability` log) is
+**frozen for the 1.x series**. The engine — memtable, multiple sorted runs,
+background compaction, crash recovery, tombstone deletes, range scans, grouped
+writes, the optional `durability` and `bloom` features, and the block cache — is
+feature-complete, hardened against hostile input, soak-tested single- and
+multi-threaded, and benchmarked.
+
+### Removed
+
+- The inert `framing` feature flag and its unused `pack-io` optional dependency.
+  The flag gated no code (typed on-disk record framing was never implemented), so
+  shipping it in the frozen 1.0 surface would have been dead weight that pulled a
+  dependency for nothing. If typed framing lands later it returns as a new
+  additive feature — a non-breaking change.
+
+### Fixed
+
+- Documentation accuracy, as part of the 1.0 definition-of-done audit: corrected
+  the stated MSRV to **1.85** (the declared, CI-verified minimum) everywhere it
+  had drifted to 1.87 in release notes; refreshed the stale `README` status
+  blockquote (it still read "pre-1.0" and listed durability/bloom as upcoming);
+  and dropped "(planned)" from the `bloom` feature in the crate-root and
+  `docs/API.md` feature tables, since it shipped in 0.5.
+
+---
+
 ## [0.9.5] - 2026-06-08
 
 Release candidate. Documentation polish only — no behaviour, API, or test change.
@@ -340,7 +369,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/lsm-db/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/lsm-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/lsm-db/compare/v0.7.0...v0.8.0

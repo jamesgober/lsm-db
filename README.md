@@ -21,7 +21,7 @@
         <strong>lsm-db</strong> is a <b>log-structured merge-tree</b> storage engine: the write path that powers RocksDB, LevelDB, Cassandra, and ScyllaDB, packaged as a clean Rust library. Writes go to an in-memory memtable backed by a durable log; when the memtable fills it is flushed to an immutable sorted run on disk; background compaction merges those runs to keep reads fast and space bounded.
     </p>
     <p>
-        It is built from the portfolio's own primitives rather than re-deriving them: durability comes from <code>wal-db</code>, point-read filtering from <code>bloom-lib</code>, and record framing from <code>pack-io</code>. That keeps the engine small and lets each primitive be audited and benchmarked once.
+        It is built from the portfolio's own primitives rather than re-deriving them: durability comes from <code>wal-db</code> and point-read filtering from <code>bloom-lib</code>. That keeps the engine small and lets each primitive be audited and benchmarked once.
     </p>
     <p>
         The common case is <code>open</code> / <code>put</code> / <code>get</code> / <code>scan</code>. Compaction strategy, level sizing, and write-buffer tuning live behind a builder.
@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Durable writes via wal-db. Background compaction. Bloom-filtered reads.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The on-disk run format is frozen for the 1.x series as of <code>0.3.0</code> (see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Durability of un-flushed writes and bloom filters are still ahead on the roadmap. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: 1.0 &mdash; stable.</strong> The public API is frozen until 2.0, and the on-disk run format is frozen for the 1.x series (since <code>0.3.0</code>; see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Crash-safe writes (<code>durability</code>) and bloom-filtered reads (<code>bloom</code>) ship as opt-in features. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -61,10 +61,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.9"
+lsm-db = "1.0"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "0.9", features = ["durability", "bloom"] }
+lsm-db = { version = "1.0", features = ["durability", "bloom"] }
 ```
 
 <br>
@@ -107,7 +107,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.9.5</code> **release candidate** for 1.0: the feature-complete, hardened engine with the **public API frozen** until 2.0 — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). The RC is documentation polish over the 0.9.0 beta; what remains before 1.0 is the Definition-of-Done audit and the release cut. See the project roadmap, <a href="./docs/API.md"><code>docs/API.md</code></a>, and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is <code>v1.0.0</code> — the first **stable** release. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>
@@ -118,7 +118,6 @@ This is the <code>v0.9.5</code> **release candidate** for 1.0: the feature-compl
 
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; memtable durability and crash recovery
 - [`bloom-lib`](https://github.com/jamesgober/bloom-lib) &mdash; SSTable point-read filtering
-- [`pack-io`](https://github.com/jamesgober/pack-io) &mdash; on-disk record framing
 - Hive DB &mdash; a candidate storage engine behind the `StorageEngine` trait
 
 It stays foreign-compatible: usable standalone as an embedded key-value store.

@@ -76,8 +76,7 @@
 //! |---------|---------|-------------|
 //! | `std` | yes | Standard library. The engine requires it. |
 //! | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. |
-//! | `bloom` | no | Bloom-filtered point lookups via `bloom-lib` (planned). |
-//! | `framing` | no | Typed on-disk record framing via `pack-io` (planned). |
+//! | `bloom` | no | Bloom-filtered point lookups via `bloom-lib`. |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
