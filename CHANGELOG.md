@@ -18,6 +18,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.0] - 2026-06-08
+
+Alpha. The engine is feature-complete, hardened, and API-frozen; this release
+begins the soak toward 1.0 by broadening coverage to a sustained,
+consumer-shaped workload across restarts. No behaviour or API change — only
+additional tests.
+
+### Added
+
+- `tests/soak.rs`: a sustained mixed workload (tens of thousands of interleaved
+  puts, overwrites, and deletes over a bounded key space, with a small buffer and
+  low compaction trigger so flushes and background compactions run throughout),
+  punctuated by close-and-reopen cycles, checked key-for-key and over a full scan
+  against a `BTreeMap` reference model. Under `--all-features` it exercises the
+  write-ahead log and bloom filters together; a companion test pins ranged scans
+  to the model under churn.
+
+---
+
 ## [0.7.0] - 2026-06-08
 
 Hardening and the **API freeze**. The engine is run through adversarial,
@@ -285,7 +304,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/lsm-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/lsm-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...v0.5.0
