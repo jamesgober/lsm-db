@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -116,6 +116,11 @@ postcard  = { version = "1", optional = true, default-features = false, features
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tempfile  = "3"
+# Comparative benchmark only (`benches/comparison.rs`): two mature pure-Rust
+# embedded key-value stores to measure lsm-db against. Dev-only — never part of
+# the published dependency graph.
+sled      = "0.34"
+redb      = "2"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
@@ -138,6 +143,10 @@ required-features = ["bloom"]
 # #################################
 [[bench]]
 name    = "lsm_bench"
+harness = false
+
+[[bench]]
+name    = "comparison"
 harness = false
 
 

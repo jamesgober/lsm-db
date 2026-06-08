@@ -17,12 +17,13 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.5.0`), feature-complete.** The Tier-1 surface below is
+> **Status: pre-1.0 (`0.6.0`), feature-complete.** The Tier-1 surface below is
 > implemented and stable in shape, over a multi-run engine with background
-> compaction, optional crash-safe writes (`durability`), and optional bloom-
-> filtered point reads (`bloom`). The on-disk format is frozen for the 1.x series
+> compaction, a block cache, optional crash-safe writes (`durability`), and
+> optional bloom-filtered point reads (`bloom`). The on-disk format is frozen for
+> the 1.x series
 > ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). The remaining 0.x work is
-> optimization and hardening, not new surface.
+> hardening with the API frozen (0.7), not new surface.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -51,6 +52,7 @@
   - [`LsmConfig`](#lsmconfig)
   - [`DEFAULT_MEMTABLE_CAPACITY`](#default_memtable_capacity)
   - [`DEFAULT_COMPACTION_TRIGGER`](#default_compaction_trigger)
+  - [`DEFAULT_BLOCK_CACHE_CAPACITY`](#default_block_cache_capacity)
   - [`Batch`](#batch)
   - [`Scan`](#scan)
   - [`Error` & `Result`](#error--result)
@@ -423,6 +425,8 @@ Tier-2 tuning parameters, passed to [`Lsm::open_with`](#lsmopen_with). Build wit
 | `.memtable_capacity_bytes(&self) -> usize` | Read the configured capacity. |
 | `.compaction_trigger(runs: usize) -> LsmConfig` | Set the run count that triggers a background compaction. Values below `2` become `2`. Consumes and returns `self`. |
 | `.compaction_trigger_runs(&self) -> usize` | Read the configured trigger. |
+| `.block_cache_capacity(bytes: usize) -> LsmConfig` | Set the block-cache capacity, in bytes of decoded blocks. `0` disables the cache. Consumes and returns `self`. |
+| `.block_cache_capacity_bytes(&self) -> usize` | Read the configured block-cache capacity. |
 
 The capacity counts key and value bytes only, not per-entry bookkeeping, so peak
 resident memory is somewhat higher than the configured number. A capacity of `0`
@@ -433,15 +437,22 @@ point read may consult every run, so the engine merges the runs into one in the
 background once there are this many. Smaller values keep reads fast at the cost
 of more compaction work.
 
+The block cache (default 8 MiB) keeps recently-read decoded run blocks so a
+repeat point lookup over a hot working set returns with no I/O, checksum, or
+parse. It is shared across all of an engine's runs; set the capacity to `0` to
+disable it.
+
 ```rust
 use lsm_db::LsmConfig;
 
-// 1 MiB write buffer; compact once eight runs pile up.
+// 1 MiB write buffer; compact once eight runs pile up; 32 MiB block cache.
 let config = LsmConfig::new()
     .memtable_capacity(1 << 20)
-    .compaction_trigger(8);
+    .compaction_trigger(8)
+    .block_cache_capacity(32 << 20);
 assert_eq!(config.memtable_capacity_bytes(), 1 << 20);
 assert_eq!(config.compaction_trigger_runs(), 8);
+assert_eq!(config.block_cache_capacity_bytes(), 32 << 20);
 
 // The defaults.
 assert_eq!(
@@ -480,6 +491,20 @@ The run count that triggers a background compaction by default.
 
 ```rust
 assert_eq!(lsm_db::DEFAULT_COMPACTION_TRIGGER, 4);
+```
+
+---
+
+### `DEFAULT_BLOCK_CACHE_CAPACITY`
+
+```rust
+pub const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 8 * 1024 * 1024; // 8 MiB
+```
+
+The block-cache capacity used by [`LsmConfig::default`].
+
+```rust
+assert_eq!(lsm_db::DEFAULT_BLOCK_CACHE_CAPACITY, 8 * 1024 * 1024);
 ```
 
 ---

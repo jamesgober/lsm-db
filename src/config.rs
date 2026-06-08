@@ -20,6 +20,13 @@ pub const DEFAULT_MEMTABLE_CAPACITY: usize = 4 * 1024 * 1024;
 /// [`LsmConfig::compaction_trigger`].
 pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
 
+/// Default block-cache capacity: 8 MiB of decoded data blocks.
+///
+/// The cache holds recently-read run blocks so a repeat point lookup over a hot
+/// working set returns with no I/O, checksum, or parse. Set to `0` to disable
+/// it. Tune with [`LsmConfig::block_cache_capacity`].
+pub const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 8 * 1024 * 1024;
+
 /// Tuning parameters for an [`Lsm`](crate::Lsm) engine.
 ///
 /// Construct with [`LsmConfig::new`] (or [`LsmConfig::default`]) and refine with
@@ -38,6 +45,7 @@ pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
 pub struct LsmConfig {
     memtable_capacity: usize,
     compaction_trigger: usize,
+    block_cache_capacity: usize,
 }
 
 impl LsmConfig {
@@ -137,6 +145,48 @@ impl LsmConfig {
     pub fn compaction_trigger_runs(&self) -> usize {
         self.compaction_trigger
     }
+
+    /// Set the block-cache capacity, in bytes of decoded data blocks.
+    ///
+    /// The cache keeps recently-read run blocks so a repeat point lookup over a
+    /// hot working set returns with no I/O, checksum, or parse. Set to `0` to
+    /// disable it (every lookup decodes directly). The capacity is approximate —
+    /// it is counted in block-sized units — and shared across all of an engine's
+    /// runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_db::LsmConfig;
+    /// // A 32 MiB block cache.
+    /// let config = LsmConfig::new().block_cache_capacity(32 * 1024 * 1024);
+    /// assert_eq!(config.block_cache_capacity_bytes(), 32 * 1024 * 1024);
+    /// // Disable the cache.
+    /// assert_eq!(LsmConfig::new().block_cache_capacity(0).block_cache_capacity_bytes(), 0);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn block_cache_capacity(mut self, bytes: usize) -> Self {
+        self.block_cache_capacity = bytes;
+        self
+    }
+
+    /// The configured block-cache capacity, in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_db::LsmConfig;
+    /// assert_eq!(
+    ///     LsmConfig::default().block_cache_capacity_bytes(),
+    ///     lsm_db::DEFAULT_BLOCK_CACHE_CAPACITY,
+    /// );
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn block_cache_capacity_bytes(&self) -> usize {
+        self.block_cache_capacity
+    }
 }
 
 impl Default for LsmConfig {
@@ -146,6 +196,7 @@ impl Default for LsmConfig {
         LsmConfig {
             memtable_capacity: DEFAULT_MEMTABLE_CAPACITY,
             compaction_trigger: DEFAULT_COMPACTION_TRIGGER,
+            block_cache_capacity: DEFAULT_BLOCK_CACHE_CAPACITY,
         }
     }
 }

@@ -100,6 +100,8 @@ mod batch;
 #[cfg(feature = "std")]
 mod bloom;
 #[cfg(feature = "std")]
+mod cache;
+#[cfg(feature = "std")]
 mod config;
 #[cfg(feature = "std")]
 mod db;
@@ -123,7 +125,9 @@ mod sstable;
 #[cfg(feature = "std")]
 pub use crate::batch::Batch;
 #[cfg(feature = "std")]
-pub use crate::config::{DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_CAPACITY, LsmConfig};
+pub use crate::config::{
+    DEFAULT_BLOCK_CACHE_CAPACITY, DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_CAPACITY, LsmConfig,
+};
 #[cfg(feature = "std")]
 pub use crate::db::Lsm;
 #[cfg(feature = "std")]

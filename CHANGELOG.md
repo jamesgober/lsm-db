@@ -18,6 +18,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.6.0] - 2026-06-08
+
+Optimization. A block cache serves hot run blocks so repeat point reads do no
+I/O, and a comparative benchmark against `sled` and `redb` is documented
+honestly. The public API gains one additive config knob; nothing changes
+behaviourally.
+
+### Added
+
+- **Block cache** (on by default, 8 MiB): a shared, sharded cache of decoded run
+  blocks. A repeat point lookup over a hot working set returns its block from
+  cache with no positioned read, no CRC32C check, and no parse. Sequential scans
+  and compaction bypass it so they do not pollute it. Eviction is sharded CLOCK
+  (the classic O(1) buffer-pool policy); no new runtime dependency.
+- `LsmConfig::block_cache_capacity` / `block_cache_capacity_bytes`, and the
+  `DEFAULT_BLOCK_CACHE_CAPACITY` constant (8 MiB). Set the capacity to `0` to
+  disable the cache.
+- `docs/PERFORMANCE.md`: reproducible micro-benchmark numbers, including a
+  fair-shape comparison against `sled` 0.34 and `redb` 2.6 (lsm-db leads point
+  reads and bulk inserts; redb's range scan is faster — see below).
+- A `benches/comparison.rs` benchmark (dev-only) driving all three engines, and
+  CI-enforced tests that a cached repeat lookup reads zero data blocks while a
+  lookup with the cache disabled reads one.
+
+### Notes
+
+- **Range scan still materialises a snapshot.** The comparison shows `redb`'s
+  in-place B-tree scan is faster than lsm-db's, which collects a consistent
+  snapshot of the range before returning. Lazy, streaming scan would close the
+  gap but requires a *fallible* `Scan` iterator (block I/O moves into iteration),
+  which conflicts with the simplified-API mandate and the upcoming 0.7 API
+  freeze. It is recorded as a post-1.0 (2.0) consideration in `dev/ROADMAP.md`.
+- The cache only affects the point-read path (positively, for hot sets); the
+  write and scan paths are unchanged, so there is no regression on them.
+
+---
+
 ## [0.5.0] - 2026-06-07
 
 Bloom filters and the feature freeze. Under the `bloom` feature, each sorted run
@@ -210,7 +247,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lsm-db/compare/v0.2.0...v0.3.0

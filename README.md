@@ -51,6 +51,7 @@
 - **Grouped writes** &mdash; apply a batch atomically with respect to concurrent readers
 - **Crash-safe writes** &mdash; under the `durability` feature, every write hits a `wal-db` log before acknowledgment and is replayed on open (no acknowledged write lost across a crash)
 - **Bloom-filtered reads** &mdash; under the `bloom` feature, a per-run filter lets a point read skip any run that can't contain the key (negative lookups read no data blocks)
+- **Block cache** &mdash; a shared cache of decoded run blocks; a repeat point read over a hot working set does no I/O, checksum, or parse
 - **Shared, thread-safe handle** &mdash; one engine, many threads, behind an `Arc`
 
 
@@ -60,10 +61,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.5"
+lsm-db = "0.6"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "0.5", features = ["durability", "bloom"] }
+lsm-db = { version = "0.6", features = ["durability", "bloom"] }
 ```
 
 <br>
@@ -106,7 +107,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.5.0</code> release and the **feature freeze**: multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), and bloom-filtered point reads (<code>bloom</code>) — all behind the same Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). The engine is feature-complete; the remaining 0.x work is optimization (0.6) and hardening with the API frozen (0.7) before 1.0. See the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
+This is the <code>v0.6.0</code> release: the feature-complete engine — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache — behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). 0.6 adds the block cache and a documented comparison against <code>sled</code>/<code>redb</code> (see <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>). The remaining 0.x work is hardening with the API frozen (0.7). See the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
 
 <hr>
 <br>

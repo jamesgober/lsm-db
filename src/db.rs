@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Op};
 use crate::bloom::{self, RunFilter};
+use crate::cache::BlockCache;
 use crate::config::LsmConfig;
 use crate::durability::Durability;
 use crate::error::{Error, Result};
@@ -76,6 +77,9 @@ struct Engine {
     cond: Condvar,
     /// The last error a background compaction produced, if any.
     last_error: Mutex<Option<Error>>,
+    /// Shared cache of decoded data blocks, consulted by point lookups across
+    /// every run.
+    cache: Arc<BlockCache>,
 }
 
 /// A log-structured merge-tree key-value store backed by a directory on disk.
@@ -168,9 +172,13 @@ impl Lsm {
         };
         let live: HashSet<&str> = run_names.iter().map(String::as_str).collect();
 
+        // Shared block cache for point lookups, sized from the config.
+        let cache = BlockCache::new(config.block_cache_capacity_bytes());
+
         // Open the live runs in recency order, attaching each run's bloom filter
         // from its sidecar (a no-op without the `bloom` feature, and a tolerated
-        // miss if a sidecar is absent — the run is simply consulted directly).
+        // miss if a sidecar is absent — the run is simply consulted directly) and
+        // the shared block cache.
         let mut runs = Vec::with_capacity(run_names.len());
         for name in &run_names {
             let path = dir.join(name);
@@ -179,6 +187,7 @@ impl Lsm {
             }
             let mut table = SsTable::open(&path)?;
             table.attach_filter(RunFilter::load(&path)?);
+            table.attach_cache(Arc::clone(&cache));
             runs.push(Arc::new(table));
         }
 
@@ -224,6 +233,7 @@ impl Lsm {
             compaction: Mutex::new(CompactionState::default()),
             cond: Condvar::new(),
             last_error: Mutex::new(None),
+            cache,
         });
 
         // Checkpoint recovered writes: persist them as a run and empty the log,
@@ -565,6 +575,7 @@ impl Engine {
         }
         let mut table = SsTable::open(&final_path)?;
         table.attach_filter(filter);
+        table.attach_cache(Arc::clone(&self.cache));
 
         let run = Arc::new(table);
         let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
@@ -644,6 +655,7 @@ impl Engine {
         }
         let mut output = SsTable::open(&final_path)?;
         output.attach_filter(filter);
+        output.attach_cache(Arc::clone(&self.cache));
         let output = Arc::new(output);
 
         // Swap: drop the inputs, keep any runs flushed during the merge, append
@@ -1014,6 +1026,51 @@ mod tests {
             assert_eq!(
                 db.get(format!("k{i}").into_bytes()).unwrap(),
                 Some(b"v".to_vec())
+            );
+        }
+    }
+
+    /// With the block cache on (the default), a repeat lookup of the same key
+    /// serves its block from cache and reads no data block.
+    #[cfg(feature = "bloom")]
+    #[test]
+    fn test_block_cache_serves_repeat_lookup() {
+        use crate::sstable::block_reads;
+
+        let (_d, db) = db(); // default config: 8 MiB block cache
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+
+        block_reads::reset();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert!(block_reads::count() >= 1, "cold lookup reads its block");
+
+        block_reads::reset();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            block_reads::count(),
+            0,
+            "a repeat lookup must be served from the block cache"
+        );
+    }
+
+    /// With the block cache disabled, every lookup reads its block.
+    #[cfg(feature = "bloom")]
+    #[test]
+    fn test_block_cache_disabled_always_reads() {
+        use crate::sstable::block_reads;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Lsm::open_with(dir.path(), LsmConfig::new().block_cache_capacity(0)).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+
+        for _ in 0..2 {
+            block_reads::reset();
+            assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+            assert!(
+                block_reads::count() >= 1,
+                "with the cache off, every lookup reads its block"
             );
         }
     }

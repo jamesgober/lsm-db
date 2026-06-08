@@ -35,11 +35,17 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bloom::{self, RunFilter};
+use crate::cache::{BlockCache, BlockKey, DecodedBlock};
 use crate::error::{Error, Result};
 use crate::record::Record;
+
+/// Process-wide source of unique per-run cache ids. Each opened run gets a fresh
+/// id, so block-cache keys never collide across runs within an engine's life.
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// File magic identifying an `lsm-db` v1 sorted run.
 const MAGIC: &[u8; 8] = b"LSMTBL01";
@@ -114,6 +120,11 @@ pub(crate) struct SsTable {
     /// Optional per-run bloom filter, attached after open; lets a point read
     /// skip this run when the key is definitely absent.
     filter: Option<RunFilter>,
+    /// Shared block cache, attached after open; point lookups serve decoded
+    /// blocks from it. `None` means no caching (every lookup decodes directly).
+    cache: Option<Arc<BlockCache>>,
+    /// Unique id for this run, used as the high half of its block-cache keys.
+    run_id: u64,
     obsolete: AtomicBool,
 }
 
@@ -170,6 +181,8 @@ impl SsTable {
             index,
             entry_count,
             filter: None,
+            cache: None,
+            run_id: NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed),
             obsolete: AtomicBool::new(false),
         })
     }
@@ -196,6 +209,13 @@ impl SsTable {
         self.filter = filter;
     }
 
+    /// Attach the engine's shared block cache so point lookups can serve decoded
+    /// blocks from it.
+    #[inline]
+    pub(crate) fn attach_cache(&mut self, cache: Arc<BlockCache>) {
+        self.cache = Some(cache);
+    }
+
     /// Whether this run might contain `key`, per its bloom filter. Returns
     /// `true` (consult the run) when there is no filter.
     #[inline]
@@ -210,20 +230,49 @@ impl SsTable {
     }
 
     /// Look up `key`, returning its [`Record`] if this run contains it.
+    ///
+    /// The single candidate block is served from the shared block cache when one
+    /// is attached, so a repeat lookup over a hot block does no I/O, checksum, or
+    /// parse.
     pub(crate) fn lookup(&self, key: &[u8]) -> Result<Option<Record>> {
         let block_idx = self.index.partition_point(|h| h.last_key.as_slice() < key);
         if block_idx >= self.index.len() {
             return Ok(None);
         }
-        let entries = self.read_block(block_idx)?;
-        Ok(entries
-            .into_iter()
+        let block = self.cached_block(block_idx)?;
+        Ok(block
+            .iter()
             .find(|(k, _)| k.as_slice() == key)
-            .map(|(_, r)| r))
+            .map(|(_, r)| r.clone()))
     }
 
-    /// Read and decode the data block at index `i`, verifying its checksum.
-    fn read_block(&self, i: usize) -> Result<Vec<(Vec<u8>, Record)>> {
+    /// The decoded block at index `i`, from the cache if present, otherwise read,
+    /// verified, decoded, and inserted. Used by point lookups.
+    fn cached_block(&self, i: usize) -> Result<Arc<DecodedBlock>> {
+        let key = BlockKey {
+            run_id: self.run_id,
+            block_idx: i as u32,
+        };
+        if let Some(cache) = &self.cache {
+            if let Some(block) = cache.get(key) {
+                return Ok(block);
+            }
+            let block = Arc::new(self.decode_block_at(i)?);
+            cache.insert(key, Arc::clone(&block));
+            return Ok(block);
+        }
+        Ok(Arc::new(self.decode_block_at(i)?))
+    }
+
+    /// Read and decode the data block at index `i`, verifying its checksum. This
+    /// is the uncached read; the sequential cursor uses it directly so a scan or
+    /// compaction does not pollute the cache.
+    fn read_block(&self, i: usize) -> Result<DecodedBlock> {
+        self.decode_block_at(i)
+    }
+
+    /// The raw positioned read + checksum + decode for block `i`.
+    fn decode_block_at(&self, i: usize) -> Result<DecodedBlock> {
         #[cfg(all(test, feature = "bloom"))]
         block_reads::record();
         let handle = &self.index[i];
