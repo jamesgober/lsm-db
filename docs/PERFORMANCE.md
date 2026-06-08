@@ -18,6 +18,10 @@
 > benchmark in [`benches/`](../benches); run `cargo bench` to reproduce them on
 > your own hardware. These are micro-benchmarks — they characterise specific
 > operations, not a full application — and absolute numbers vary by machine.
+>
+> **These are the locked benchmark baselines for the 1.0 line** (confirmed at the
+> `0.9.0` beta). The engine's hot paths are unchanged since the block cache
+> landed in `0.6`; a regression beyond 5% on any tracked metric blocks a release.
 
 ## Reproducing
 

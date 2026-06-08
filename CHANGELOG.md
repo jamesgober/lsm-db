@@ -18,6 +18,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.0] - 2026-06-08
+
+Beta. Broader concurrency testing and the benchmark baselines locked for the 1.0
+line. No behaviour or API change.
+
+### Added
+
+- `tests/concurrency_soak.rs`: a multi-threaded soak — six writer threads (each
+  over a disjoint key slice, put-then-delete so the final live set is exactly
+  computable) and three reader threads scanning continuously, all over one shared
+  engine with background compaction running throughout. Readers must observe only
+  strictly-ascending, duplicate-free scans; after the writers finish, a full scan
+  must equal the exact union of what they left, and survive a reopen. Runs with
+  the write-ahead log and bloom filters under `--all-features`.
+
+### Changed
+
+- `docs/PERFORMANCE.md` records its numbers as the **locked benchmark baselines
+  for the 1.0 line** (confirmed at this beta; hot paths unchanged since 0.6).
+
+---
+
 ## [0.8.0] - 2026-06-08
 
 Alpha. The engine is feature-complete, hardened, and API-frozen; this release
@@ -304,7 +326,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/lsm-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/lsm-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/lsm-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...v0.6.0

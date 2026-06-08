@@ -61,10 +61,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.8"
+lsm-db = "0.9"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "0.8", features = ["durability", "bloom"] }
+lsm-db = { version = "0.9", features = ["durability", "bloom"] }
 ```
 
 <br>
@@ -107,7 +107,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.8.0</code> **alpha** in the run to 1.0: the feature-complete, hardened engine with the **public API frozen** until 2.0 — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). From here to 1.0 is soak and polish — broader testing, then a beta and RC — with only additive, non-breaking changes. See the project roadmap, <a href="./docs/API.md"><code>docs/API.md</code></a>, and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is the <code>v0.9.0</code> **beta** in the run to 1.0: the feature-complete, hardened engine with the **public API frozen** until 2.0 — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). The beta adds a multi-threaded concurrency soak and locks the benchmark baselines; what remains before 1.0 is an RC (doc polish) and the release cut. See the project roadmap, <a href="./docs/API.md"><code>docs/API.md</code></a>, and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>
