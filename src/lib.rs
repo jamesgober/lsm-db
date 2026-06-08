@@ -98,6 +98,8 @@
 #[cfg(feature = "std")]
 mod batch;
 #[cfg(feature = "std")]
+mod bloom;
+#[cfg(feature = "std")]
 mod config;
 #[cfg(feature = "std")]
 mod db;

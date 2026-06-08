@@ -37,6 +37,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::bloom::{self, RunFilter};
 use crate::error::{Error, Result};
 use crate::record::Record;
 
@@ -60,6 +61,33 @@ const TAG_VALUE: u8 = 0;
 /// Tag byte for a tombstone.
 const TAG_TOMBSTONE: u8 = 1;
 
+/// Per-thread data-block read counter, compiled only for the bloom tests. It
+/// lets a test assert that a bloom filter actually cuts the number of blocks
+/// read on a negative lookup. Thread-local so parallel tests do not interfere.
+#[cfg(all(test, feature = "bloom"))]
+pub(crate) mod block_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Record one data-block read on the current thread.
+    pub(crate) fn record() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Reset the current thread's counter to zero.
+    pub(crate) fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+
+    /// The current thread's data-block read count.
+    pub(crate) fn count() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// One index record: the last key of a data block and where the block lives.
 #[derive(Debug, Clone)]
 struct BlockHandle {
@@ -80,6 +108,12 @@ pub(crate) struct SsTable {
     file: File,
     path: PathBuf,
     index: Vec<BlockHandle>,
+    /// Number of entries (values + tombstones), read from the footer. Used to
+    /// size the bloom filter built during compaction.
+    entry_count: u64,
+    /// Optional per-run bloom filter, attached after open; lets a point read
+    /// skip this run when the key is definitely absent.
+    filter: Option<RunFilter>,
     obsolete: AtomicBool,
 }
 
@@ -106,9 +140,7 @@ impl SsTable {
         if &footer[28..36] != MAGIC {
             return Err(Error::corruption("bad magic; not an lsm-db sorted run"));
         }
-        // footer[0..8] is the entry count, recorded for external tooling; the
-        // reader locates everything from the fixed footer offsets and does not
-        // need it.
+        let entry_count = u64::from_le_bytes(arr8(&footer[0..8]));
         let index_offset = u64::from_le_bytes(arr8(&footer[8..16]));
         let index_len = u64::from_le_bytes(arr8(&footer[16..24]));
         let index_crc = u32::from_le_bytes(arr4(&footer[24..28]));
@@ -136,6 +168,8 @@ impl SsTable {
             file,
             path: path.to_path_buf(),
             index,
+            entry_count,
+            filter: None,
             obsolete: AtomicBool::new(false),
         })
     }
@@ -146,6 +180,27 @@ impl SsTable {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// The number of entries (values + tombstones) recorded in the run.
+    #[inline]
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    /// Attach a bloom filter to this run (built at write time, or loaded from
+    /// the sidecar on reopen). A `None` leaves the run with no filter, so every
+    /// lookup consults it directly.
+    #[inline]
+    pub(crate) fn attach_filter(&mut self, filter: Option<RunFilter>) {
+        self.filter = filter;
+    }
+
+    /// Whether this run might contain `key`, per its bloom filter. Returns
+    /// `true` (consult the run) when there is no filter.
+    #[inline]
+    pub(crate) fn might_contain(&self, key: &[u8]) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.might_contain(key))
     }
 
     /// Mark the run as superseded; its file is removed when the last [`SsTable`]
@@ -169,6 +224,8 @@ impl SsTable {
 
     /// Read and decode the data block at index `i`, verifying its checksum.
     fn read_block(&self, i: usize) -> Result<Vec<(Vec<u8>, Record)>> {
+        #[cfg(all(test, feature = "bloom"))]
+        block_reads::record();
         let handle = &self.index[i];
         let mut buf = vec![0u8; handle.len as usize];
         pread_exact(&self.file, &mut buf, handle.offset)
@@ -190,8 +247,10 @@ impl Drop for SsTable {
         if self.obsolete.load(Ordering::Acquire) {
             // Best effort: the run is already out of the live set, so a failed
             // unlink only leaves a file that the next open will reclaim as an
-            // orphan. Closing the handle first keeps this valid on Windows.
+            // orphan. Closing the handle first keeps this valid on Windows. The
+            // bloom sidecar is removed alongside the run it describes.
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(bloom::sidecar_path(&self.path));
         }
     }
 }

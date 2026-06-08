@@ -78,11 +78,38 @@ fn bench_scan(c: &mut Criterion) {
     });
 }
 
+/// Negative lookups across many runs. This is where bloom filters pay off:
+/// without the `bloom` feature each run costs a candidate-block read; with it,
+/// every run is skipped. Run `cargo bench --bench lsm_bench negative_lookup`
+/// with and without `--features bloom` to see the difference.
+fn bench_negative_lookup_many_runs(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A high trigger keeps the flushed runs separate so the lookup must consult
+    // all of them (absent the filter).
+    let db = Lsm::open_with(dir.path(), LsmConfig::new().compaction_trigger(64)).expect("open");
+    for run in 0..16u32 {
+        for i in 0..2_000u32 {
+            // Even keys present in every run; odd keys never present.
+            db.put(key(i * 2), b"v").expect("put");
+        }
+        let _ = run;
+        db.flush().expect("flush");
+    }
+    c.bench_function("negative_lookup_16_runs", |b| {
+        let mut i = 1u32;
+        b.iter(|| {
+            i = (i + 2) % 4_000; // odd keys: always absent
+            black_box(db.get(black_box(key(i))).expect("get"));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_put,
     bench_get_hit,
     bench_get_miss,
-    bench_scan
+    bench_scan,
+    bench_negative_lookup_many_runs
 );
 criterion_main!(benches);

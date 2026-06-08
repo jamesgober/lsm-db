@@ -26,6 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Op};
+use crate::bloom::{self, RunFilter};
 use crate::config::LsmConfig;
 use crate::durability::Durability;
 use crate::error::{Error, Result};
@@ -167,14 +168,18 @@ impl Lsm {
         };
         let live: HashSet<&str> = run_names.iter().map(String::as_str).collect();
 
-        // Open the live runs in recency order.
+        // Open the live runs in recency order, attaching each run's bloom filter
+        // from its sidecar (a no-op without the `bloom` feature, and a tolerated
+        // miss if a sidecar is absent — the run is simply consulted directly).
         let mut runs = Vec::with_capacity(run_names.len());
         for name in &run_names {
             let path = dir.join(name);
             if !path.exists() {
                 return Err(Error::corruption("manifest references a missing run"));
             }
-            runs.push(Arc::new(SsTable::open(&path)?));
+            let mut table = SsTable::open(&path)?;
+            table.attach_filter(RunFilter::load(&path)?);
+            runs.push(Arc::new(table));
         }
 
         // Reclaim orphans (temporaries and runs no longer in the manifest) and
@@ -185,6 +190,13 @@ impl Lsm {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".tmp") {
                 fs::remove_file(entry.path()).map_err(|e| Error::io("remove temporary file", e))?;
+            } else if let Some(run) = name.strip_suffix(".bloom") {
+                // A bloom sidecar whose run is not live is an orphan (e.g. from a
+                // compaction that crashed before its manifest commit).
+                if !live.contains(run) {
+                    fs::remove_file(entry.path())
+                        .map_err(|e| Error::io("remove orphan bloom sidecar", e))?;
+                }
             } else if let Some(seq) = manifest::seq_of(&name) {
                 next_seq = next_seq.max(seq + 1);
                 if !live.contains(name.as_str()) {
@@ -467,8 +479,12 @@ impl Engine {
                 None => inner.runs.clone(),
             }
         };
-        // Runs are searched newest first, with no lock held.
+        // Runs are searched newest first, with no lock held. The bloom filter
+        // lets a definite miss skip the run without reading any block.
         for run in &runs {
+            if !run.might_contain(key) {
+                continue;
+            }
             match run.lookup(key)? {
                 Some(Record::Value(value)) => return Ok(Some(value)),
                 Some(Record::Tombstone) => return Ok(None),
@@ -533,13 +549,24 @@ impl Engine {
         let final_path = self.dir.join(&name);
 
         let mut writer = SsTableWriter::create(&tmp)?;
+        let mut filter = bloom::builder(entries.len());
         for (key, record) in &entries {
             writer.push(key, record)?;
+            filter.add(key);
         }
         writer.finish()?;
         fs::rename(&tmp, &final_path).map_err(|e| Error::io("install flushed run", e))?;
 
-        let run = Arc::new(SsTable::open(&final_path)?);
+        // Write the bloom sidecar before the manifest commit, so any run the
+        // manifest names is guaranteed to have its sidecar on disk.
+        let filter = filter.finish();
+        if let Some(filter) = &filter {
+            filter.write_sidecar(&final_path)?;
+        }
+        let mut table = SsTable::open(&final_path)?;
+        table.attach_filter(filter);
+
+        let run = Arc::new(table);
         let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
         new_runs.push(run);
         new_runs.extend(inner.runs.iter().cloned());
@@ -583,11 +610,20 @@ impl Engine {
             inner.runs.clone()
         };
 
+        // Size the output filter from the sum of input entry counts — an upper
+        // bound (dedup only lowers the real count), so the filter is never
+        // under-sized.
+        let capacity: usize = inputs
+            .iter()
+            .map(|r| usize::try_from(r.entry_count()).unwrap_or(usize::MAX))
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+
         // Merge into a new run with no lock held.
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let name = manifest::run_filename(seq);
         let tmp = self.dir.join(format!("{name}.tmp"));
         let final_path = self.dir.join(&name);
+        let mut filter = bloom::builder(capacity);
         {
             let mut writer = SsTableWriter::create(&tmp)?;
             let cursors = inputs.iter().map(|r| r.cursor()).collect();
@@ -596,11 +632,19 @@ impl Engine {
             for item in Merge::new(Vec::new(), cursors) {
                 let (key, value) = item?;
                 writer.push(&key, &Record::Value(value))?;
+                filter.add(&key);
             }
             writer.finish()?;
         }
         fs::rename(&tmp, &final_path).map_err(|e| Error::io("install compacted run", e))?;
-        let output = Arc::new(SsTable::open(&final_path)?);
+
+        let filter = filter.finish();
+        if let Some(filter) = &filter {
+            filter.write_sidecar(&final_path)?;
+        }
+        let mut output = SsTable::open(&final_path)?;
+        output.attach_filter(filter);
+        let output = Arc::new(output);
 
         // Swap: drop the inputs, keep any runs flushed during the merge, append
         // the output as the oldest run.
@@ -893,5 +937,84 @@ mod tests {
     fn test_engine_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Lsm>();
+    }
+
+    /// The bloom-filter contract (`bloom` feature): a negative point lookup
+    /// reads no data blocks, because every run's filter rejects the absent key,
+    /// while a positive lookup still reads a block. This is the deterministic,
+    /// CI-enforced form of the 0.5 exit criterion.
+    #[cfg(feature = "bloom")]
+    #[test]
+    fn test_bloom_skips_blocks_on_negative_lookup() {
+        use crate::sstable::block_reads;
+
+        let (_d, db) = db_no_autocompact();
+        // Several runs, each covering an overlapping key range, so an absent key
+        // would otherwise force one candidate-block read per run.
+        for run in 0..6u32 {
+            for i in 0..50u32 {
+                let key = format!("k{:04}", i * 2); // even keys only
+                db.put(key.as_bytes(), format!("r{run}").as_bytes())
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert_eq!(db.run_count(), 6);
+
+        // Negative lookup for an odd key that sorts *inside* every run's range.
+        block_reads::reset();
+        assert_eq!(db.get(b"k0051").unwrap(), None);
+        assert_eq!(
+            block_reads::count(),
+            0,
+            "bloom filters must let a negative lookup skip every run with no block read"
+        );
+
+        // A positive lookup does read a block (the counter is wired correctly).
+        block_reads::reset();
+        assert!(db.get(b"k0010").unwrap().is_some());
+        assert!(
+            block_reads::count() >= 1,
+            "a hit must read at least one block"
+        );
+    }
+
+    /// Compaction installs a sidecar for its output and removes the obsoleted
+    /// inputs' sidecars, leaving exactly one sidecar per live run.
+    #[cfg(feature = "bloom")]
+    #[test]
+    fn test_bloom_sidecars_track_runs_through_compaction() {
+        let count = |dir: &std::path::Path, suffix: &str| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(suffix)
+                })
+                .count()
+        };
+
+        let (dir, db) = db_no_autocompact();
+        for i in 0..5u32 {
+            db.put(format!("k{i}").into_bytes(), b"v").unwrap();
+            db.flush().unwrap();
+        }
+        assert_eq!(count(dir.path(), ".sst.bloom"), 5);
+
+        db.compact_now().unwrap();
+        assert_eq!(db.run_count(), 1);
+        // Exactly one run and one sidecar; the obsoleted inputs' sidecars are
+        // gone (dropped alongside their runs).
+        assert_eq!(count(dir.path(), ".sst"), 1);
+        assert_eq!(count(dir.path(), ".sst.bloom"), 1);
+        for i in 0..5u32 {
+            assert_eq!(
+                db.get(format!("k{i}").into_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
     }
 }

@@ -17,11 +17,12 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.4.0`).** The Tier-1 surface below is implemented and
-> stable in shape, over a multi-run engine with background compaction and
-> optional crash-safe writes (the `durability` feature). The on-disk format is
-> frozen for the 1.x series ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)).
-> Sections marked _(planned)_ describe surface that lands later in the 0.x series.
+> **Status: pre-1.0 (`0.5.0`), feature-complete.** The Tier-1 surface below is
+> implemented and stable in shape, over a multi-run engine with background
+> compaction, optional crash-safe writes (`durability`), and optional bloom-
+> filtered point reads (`bloom`). The on-disk format is frozen for the 1.x series
+> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). The remaining 0.x work is
+> optimization and hardening, not new surface.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
@@ -722,6 +723,42 @@ The durable write path is currently serial — each write holds the engine lock
 across its `fsync` — so it trades throughput for the guarantee; batched group
 commit is a later optimisation.
 
+### Bloom-filtered reads (`bloom` feature)
+
+A point lookup that misses the memtable has to consult the on-disk runs. Enable
+the `bloom` feature to give each run a bloom filter over its keys, so a lookup
+skips any run whose filter rejects the key — without reading a single data
+block:
+
+```toml
+[dependencies]
+lsm-db = { version = "0.5", features = ["bloom"] }
+```
+
+The win is on negative lookups across many runs: in a benchmark of misses over
+16 runs this cut a lookup from ~280 µs to ~3 µs. Filters never produce false
+negatives, so skipping a run they reject is always safe; a false positive merely
+falls through to a normal, correct lookup. The public API is identical with or
+without the feature.
+
+Because the on-disk run format is frozen for the 1.x series, the filter is not
+embedded in the run — it lives in a **sidecar** file (`<run>.sst.bloom`) written
+when the run is created and loaded when it is reopened. A sidecar is a pure
+acceleration hint: if it is missing or unreadable, the run is consulted directly
+with identical results.
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+db.put(b"present", b"1")?;
+db.flush()?;
+// With `bloom`, this miss is answered from the filter, touching no data block.
+assert_eq!(db.get(b"absent")?, None);
+# Ok(())
+# }
+```
+
 ---
 
 ## Feature flags
@@ -730,7 +767,7 @@ commit is a later optimisation.
 |---------|---------|-------------|
 | `std` | yes | Standard library. The engine requires it. |
 | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. See [above](#crash-safe-writes-durability-feature). |
-| `bloom` | no | Bloom-filtered point lookups via `bloom-lib`. _(planned: 0.5)_ |
+| `bloom` | no | Per-run bloom filters that skip runs on point reads. See [above](#bloom-filtered-reads-bloom-feature). |
 | `framing` | no | Typed on-disk record framing via `pack-io`. _(planned)_ |
 
 All features are additive: enabling one never removes functionality.

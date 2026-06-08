@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -73,8 +73,10 @@ default = ["std"]
 std = []
 # Crash-safe memtable durability via `wal-db`.
 durability = ["dep:wal-db"]
-# Bloom-filtered SSTable point lookups.
-bloom = ["dep:bloom-lib"]
+# Bloom-filtered SSTable point lookups: a per-run filter (persisted in a
+# sidecar file via `postcard`) lets a point read skip any run that cannot
+# contain the key.
+bloom = ["dep:bloom-lib", "dep:postcard"]
 # On-disk record framing via `pack-io`.
 framing = ["dep:pack-io"]
 
@@ -98,8 +100,14 @@ crc32c = "0.6"
 # wired here so the public surface and CI matrix stay stable as the matching
 # milestones land them: durability (0.4), framing (0.4), bloom (0.5).
 wal-db    = { version = "1.0", optional = true, default-features = false }
-bloom-lib = { version = "1.0", optional = true, default-features = false }
+# `serde` so a built filter can be persisted to / loaded from its sidecar; the
+# default hasher is fixed-seed, so a reloaded filter answers identically.
+bloom-lib = { version = "1.0", optional = true, default-features = false, features = ["std", "serde"] }
 pack-io   = { version = "1.0", optional = true, default-features = false }
+
+# Compact, no_std, serde-based codec for the bloom-filter sidecar files. Pulled
+# only by the `bloom` feature.
+postcard  = { version = "1", optional = true, default-features = false, features = ["alloc"] }
 
 
 # DEV DEPENDENCIES
@@ -111,6 +119,19 @@ tempfile  = "3"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+# Most examples use only the default surface and are auto-discovered. These two
+# demonstrate feature-gated behaviour, so they require their feature to build.
+[[example]]
+name              = "durable_store"
+required-features = ["durability"]
+
+[[example]]
+name              = "bloom_point_reads"
+required-features = ["bloom"]
 
 
 # BENCHMARKS

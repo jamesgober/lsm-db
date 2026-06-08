@@ -41,8 +41,6 @@
 
 <h2>What it does</h2>
 
-**Available now (`0.3`):**
-
 - **Memtable** &mdash; in-memory sorted write buffer; flushes to an immutable sorted run when full
 - **Multiple sorted runs** &mdash; each flush appends a run; reads merge across all of them, newest first
 - **Background compaction** &mdash; a dedicated thread merges runs to bound read amplification, concurrent with reads and writes
@@ -52,12 +50,8 @@
 - **Range scans** &mdash; merge the buffer and every run into one sorted stream
 - **Grouped writes** &mdash; apply a batch atomically with respect to concurrent readers
 - **Crash-safe writes** &mdash; under the `durability` feature, every write hits a `wal-db` log before acknowledgment and is replayed on open (no acknowledged write lost across a crash)
+- **Bloom-filtered reads** &mdash; under the `bloom` feature, a per-run filter lets a point read skip any run that can't contain the key (negative lookups read no data blocks)
 - **Shared, thread-safe handle** &mdash; one engine, many threads, behind an `Arc`
-
-**On the roadmap:**
-
-- **Bloom filters** &mdash; skip runs that can't contain a key, under `bloom` (`0.5`)
-- **Pluggable comparator** &mdash; custom key ordering (`0.5`)
 
 
 <br>
@@ -66,10 +60,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.4"
+lsm-db = "0.5"
 
-# Crash-safe writes via a write-ahead log:
-lsm-db = { version = "0.4", features = ["durability"] }
+# Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
+lsm-db = { version = "0.5", features = ["durability", "bloom"] }
 ```
 
 <br>
@@ -112,7 +106,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.4.0</code> release: multiple on-disk runs, background compaction, a frozen on-disk format, and crash-safe writes via a write-ahead log under the <code>durability</code> feature — behind the same Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). Bloom-filtered reads and a pluggable comparator land across the rest of the 0.x series per the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
+This is the <code>v0.5.0</code> release and the **feature freeze**: multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), and bloom-filtered point reads (<code>bloom</code>) — all behind the same Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). The engine is feature-complete; the remaining 0.x work is optimization (0.6) and hardening with the API frozen (0.7) before 1.0. See the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
 
 <hr>
 <br>

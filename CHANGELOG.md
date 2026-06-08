@@ -18,6 +18,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.5.0] - 2026-06-07
+
+Bloom filters and the feature freeze. Under the `bloom` feature, each sorted run
+carries a bloom filter over its keys, so a point read can skip any run that
+cannot contain the key — a negative lookup across many runs now reads no data
+blocks at all. The engine is feature-complete; the remaining 0.x releases are
+optimization (0.6) and hardening with the API frozen (0.7).
+
+The public API is unchanged. The on-disk run format (frozen since 0.3) is
+untouched: the filter lives in a sidecar file beside each run.
+
+### Added
+
+- `bloom` feature: a per-run bloom filter (`bloom-lib`) lets a point lookup skip
+  any run whose filter rejects the key, with no false negatives. In a benchmark
+  of negative lookups across 16 runs this cut a lookup from ~280 µs to ~3 µs.
+- Bloom sidecar files (`<run>.sst.bloom`, encoded with `postcard`): the filter
+  is written when a run is created and loaded when it is reopened, so the frozen
+  run format is not touched. A sidecar is a pure acceleration hint — if it is
+  missing or corrupt the run is consulted directly, with identical results.
+  Sidecars are removed alongside the runs they describe during compaction.
+- Tests: a deterministic, CI-enforced check that a negative lookup reads zero
+  data blocks under the `bloom` feature; sidecar round-trip, missing-sidecar and
+  corrupt-sidecar graceful-degradation, and sidecar/compaction lifecycle tests;
+  a negative-lookup benchmark.
+- Examples: `durable_store` (crash-safe writes via `durability`) and
+  `bloom_point_reads` (bloom-skipped negative lookups).
+
+### Changed
+
+- `bloom-lib` is pulled (with `serde`) by the `bloom` feature, and `postcard` as
+  its sidecar codec.
+
+### Notes
+
+- **Feature freeze declared.** With bloom filters in place the engine is
+  feature-complete; only optimization and hardening remain before 1.0.
+- **Pluggable comparator dropped from 1.0 scope.** It would require threading a
+  generic comparator parameter through every public type (`Lsm<C>`, …), which
+  conflicts with the simplified-API mandate; lexicographic byte ordering covers
+  the common case (encode keys to sort), matching `sled` and `redb`. Recorded in
+  `dev/ROADMAP.md`.
+
+---
+
 ## [0.4.0] - 2026-06-07
 
 Durability and crash recovery. Under the `durability` feature, every write is
@@ -165,7 +210,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lsm-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lsm-db/compare/v0.1.0...v0.2.0
