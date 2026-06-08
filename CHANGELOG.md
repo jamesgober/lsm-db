@@ -18,6 +18,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.7.0] - 2026-06-08
+
+Hardening and the **API freeze**. The engine is run through adversarial,
+hostile-input property tests and edge cases, a fuzz harness is added, and the
+public API is frozen — no breaking change until 2.0. The on-disk format (frozen
+since 0.3) is unchanged.
+
+### Security
+
+- **Fixed a panic on a corrupt bloom sidecar.** A sidecar containing arbitrary
+  bytes could `postcard`-deserialize into an internally-inconsistent `bloom-lib`
+  filter that panicked (out-of-bounds) when queried. The sidecar is now wrapped
+  in a magic + CRC32C integrity envelope, so only bytes this crate actually wrote
+  — which always encode a self-consistent filter — are ever deserialized. A
+  corrupt or hostile sidecar is discarded and the run is consulted directly.
+  (Found by the new adversarial tests.)
+
+### Added
+
+- `tests/adversarial.rs`: property tests that apply arbitrary corruption
+  (bit-flips, truncation, garbage) to the run file, manifest, write-ahead log,
+  and bloom sidecar, then reopen — asserting the engine returns a `Result` and
+  never panics or over-allocates on hostile input.
+- `tests/edge_cases.rs`: multi-megabyte values, 50 un-compacted runs, empty and
+  64 KiB keys, empty values, and an I/O failure mid-flush surfacing as an `Error`
+  rather than a panic.
+- `fuzz/`: an isolated `cargo-fuzz` harness (`recover` and `sidecar` targets)
+  over the public `Lsm::open` parse/recovery path. Run with
+  `cargo +nightly fuzz run <target>`; not built by the normal CI.
+
+### Changed
+
+- **The public API is frozen as of 0.7.0** (until 2.0). The frozen surface is
+  recorded in `dev/ROADMAP.md`. Remaining 0.x releases make only additive,
+  non-breaking changes.
+
+---
+
 ## [0.6.0] - 2026-06-08
 
 Optimization. A block cache serves hot run blocks so repeat point reads do no
@@ -247,7 +285,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/lsm-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/lsm-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/lsm-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lsm-db/compare/v0.3.0...v0.4.0

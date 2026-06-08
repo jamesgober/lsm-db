@@ -17,13 +17,13 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: pre-1.0 (`0.6.0`), feature-complete.** The Tier-1 surface below is
-> implemented and stable in shape, over a multi-run engine with background
-> compaction, a block cache, optional crash-safe writes (`durability`), and
-> optional bloom-filtered point reads (`bloom`). The on-disk format is frozen for
-> the 1.x series
-> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). The remaining 0.x work is
-> hardening with the API frozen (0.7), not new surface.
+> **Status: pre-1.0 (`0.7.0`), feature-complete, API frozen.** The surface below
+> is frozen until 2.0 — no breaking change — over a multi-run engine with
+> background compaction, a block cache, optional crash-safe writes
+> (`durability`), and optional bloom-filtered point reads (`bloom`). The on-disk
+> format is frozen for the 1.x series
+> ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). The remaining 0.x releases are
+> bug-fix and doc polish toward 1.0.
 
 <h4 id="example-pointers">Example Pointers</h4>
 

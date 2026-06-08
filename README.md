@@ -61,10 +61,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.6"
+lsm-db = "0.7"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "0.6", features = ["durability", "bloom"] }
+lsm-db = { version = "0.7", features = ["durability", "bloom"] }
 ```
 
 <br>
@@ -107,7 +107,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is the <code>v0.6.0</code> release: the feature-complete engine — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache — behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). 0.6 adds the block cache and a documented comparison against <code>sled</code>/<code>redb</code> (see <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>). The remaining 0.x work is hardening with the API frozen (0.7). See the project roadmap and <a href="./docs/API.md"><code>docs/API.md</code></a>.
+This is the <code>v0.7.0</code> release: the feature-complete, hardened engine with the **public API frozen** until 2.0 — multiple on-disk runs, background compaction, a frozen on-disk format, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). 0.7 adds adversarial hostile-input tests, edge-case coverage, and a fuzz harness. The remaining 0.x releases are bug-fix and doc polish toward 1.0 — only additive, non-breaking changes. See the project roadmap, <a href="./docs/API.md"><code>docs/API.md</code></a>, and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>

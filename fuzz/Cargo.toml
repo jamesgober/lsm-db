@@ -1,0 +1,36 @@
+# cargo-fuzz harness for the on-disk parse / recovery paths. Run with:
+#   cargo +nightly fuzz run recover
+#   cargo +nightly fuzz run sidecar
+# This is a standalone crate (its own `[workspace]`) so the main package's
+# `cargo build`/`clippy`/`test` never pull it in. CI does not build it.
+[package]
+name = "lsm-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+# All on-disk parse paths (run, manifest, bloom sidecar, write-ahead log) are
+# reachable through the public `Lsm::open`, so the harness enables every feature.
+lsm-db = { path = "..", features = ["bloom", "durability"] }
+
+[[bin]]
+name = "recover"
+path = "fuzz_targets/recover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sidecar"
+path = "fuzz_targets/sidecar.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

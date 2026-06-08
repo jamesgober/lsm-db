@@ -99,6 +99,10 @@ mod enabled {
     /// block read — the rest fall through to a normal, still-correct lookup.
     const FALSE_POSITIVE_RATE: f64 = 0.01;
 
+    /// Magic prefix of a sidecar file: identifies the format and guards against
+    /// feeding unrelated bytes to the deserializer.
+    const SIDECAR_MAGIC: &[u8; 8] = b"LSMBLM01";
+
     /// A bloom filter over the keys of one sorted run.
     #[derive(Debug)]
     pub(crate) struct RunFilter {
@@ -147,9 +151,15 @@ mod enabled {
     impl RunFilter {
         /// Load the filter for the run at `run_path` from its sidecar.
         ///
-        /// Returns `Ok(None)` when the sidecar is absent or unreadable as a
-        /// filter — both are non-fatal: the run is simply consulted directly. A
+        /// Returns `Ok(None)` when the sidecar is absent or fails its integrity
+        /// envelope — both are non-fatal: the run is simply consulted directly. A
         /// genuine I/O failure (for example a permission error) is propagated.
+        ///
+        /// The envelope (magic + CRC32C over the payload) is the security
+        /// boundary: only bytes this crate actually wrote — which always encode a
+        /// self-consistent filter — are passed to the deserializer, so a
+        /// corrupt or hostile sidecar can never produce a filter that panics when
+        /// queried.
         pub(crate) fn load(run_path: &Path) -> Result<Option<RunFilter>> {
             let path = sidecar_path(run_path);
             let bytes = match fs::read(&path) {
@@ -157,22 +167,42 @@ mod enabled {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(Error::io("read bloom sidecar", e)),
             };
-            match postcard::from_bytes::<BloomFilter<[u8]>>(&bytes) {
-                Ok(filter) => Ok(Some(RunFilter { filter })),
+            match Self::decode(&bytes) {
+                Some(filter) => Ok(Some(RunFilter { filter })),
                 // A corrupt sidecar is a discardable hint, not data loss.
-                Err(_) => {
+                None => {
                     let _ = fs::remove_file(&path);
                     Ok(None)
                 }
             }
         }
 
+        /// Parse a sidecar envelope, returning the filter only if the magic and
+        /// checksum both match. Any inconsistency yields `None`.
+        fn decode(bytes: &[u8]) -> Option<BloomFilter<[u8]>> {
+            // magic (8) + crc (4) + payload.
+            if bytes.len() < 12 || &bytes[0..8] != SIDECAR_MAGIC {
+                return None;
+            }
+            let crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            let payload = &bytes[12..];
+            if crc32c::crc32c(payload) != crc {
+                return None;
+            }
+            postcard::from_bytes::<BloomFilter<[u8]>>(payload).ok()
+        }
+
         /// Write the filter to the sidecar for the run at `run_path`, atomically
-        /// (temporary file, then rename).
+        /// (temporary file, then rename), wrapped in its integrity envelope.
         pub(crate) fn write_sidecar(&self, run_path: &Path) -> Result<()> {
             let path = sidecar_path(run_path);
-            let bytes = postcard::to_allocvec(&self.filter)
+            let payload = postcard::to_allocvec(&self.filter)
                 .map_err(|_| Error::corruption("failed to encode bloom sidecar"))?;
+            let mut bytes = Vec::with_capacity(12 + payload.len());
+            bytes.extend_from_slice(SIDECAR_MAGIC);
+            bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+
             let mut tmp = path.clone().into_os_string();
             tmp.push(".tmp");
             let tmp = std::path::PathBuf::from(tmp);
