@@ -67,7 +67,7 @@
 
 ```toml
 [dependencies]
-lsm-db = "0.2"
+lsm-db = "0.9"
 ```
 
 The engine requires the standard library, which is on by default. See
@@ -117,8 +117,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   [`scan`](#lsmscan). No builder, no generics to name.
 - **Tier 2 — tuning.** [`LsmConfig`](#lsmconfig) passed to
   [`Lsm::open_with`](#lsmopen_with), and [`Batch`](#batch) for grouped writes.
-- **Tier 3 — extension traits.** The trait seams for custom backends and
-  comparators. _(planned, lands across 0.x.)_
+
+There is no Tier-3 trait seam in the 1.0 surface: keys are ordered
+lexicographically and the engine is concrete. A pluggable comparator was
+considered and deliberately left out to keep the API simple (encode keys to sort
+when you need a custom order, as with `sled` / `redb`).
 
 ---
 
@@ -718,7 +721,7 @@ that gap:
 
 ```toml
 [dependencies]
-lsm-db = { version = "0.4", features = ["durability"] }
+lsm-db = { version = "0.9", features = ["durability"] }
 ```
 
 With it on, every `put` / `delete` / `write` is appended to a `wal-db`
@@ -757,7 +760,7 @@ block:
 
 ```toml
 [dependencies]
-lsm-db = { version = "0.5", features = ["bloom"] }
+lsm-db = { version = "0.9", features = ["bloom"] }
 ```
 
 The win is on negative lookups across many runs: in a benchmark of misses over
