@@ -40,32 +40,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bloom::{self, RunFilter};
 use crate::cache::{BlockCache, BlockKey, DecodedBlock};
+use crate::crc::crc32c;
 use crate::error::{Error, Result};
+use crate::format::{
+    self, BlockEntries, FOOTER_LEN, Footer, IndexEntries, MAGIC, TARGET_BLOCK_SIZE,
+};
 use crate::record::Record;
 
 /// Process-wide source of unique per-run cache ids. Each opened run gets a fresh
 /// id, so block-cache keys never collide across runs within an engine's life.
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
-/// File magic identifying an `lsm-db` v1 sorted run.
-const MAGIC: &[u8; 8] = b"LSMTBL01";
-
-/// Fixed footer size: `entry_count` + `index_offset` + `index_len` +
-/// `index_crc` + `magic`.
-const FOOTER_SIZE: u64 = 8 + 8 + 8 + 4 + 8;
-
-/// Target size of a data block before it is flushed. A single entry larger than
-/// this becomes a block of its own; entries are never split across blocks.
-const TARGET_BLOCK_SIZE: usize = 4 * 1024;
-
-/// Hard cap on any single length prefix read from disk, in bytes. A corrupt or
-/// hostile prefix must not drive an unbounded allocation.
-const MAX_RECORD_LEN: u32 = 1 << 30;
-
-/// Tag byte for a live value.
-const TAG_VALUE: u8 = 0;
-/// Tag byte for a tombstone.
-const TAG_TOMBSTONE: u8 = 1;
+/// Footer size as a file offset.
+const FOOTER_SIZE: u64 = FOOTER_LEN as u64;
 
 /// Per-thread data-block read counter, compiled only for the bloom tests. It
 /// lets a test assert that a bloom filter actually cuts the number of blocks
@@ -145,36 +132,25 @@ impl SsTable {
         }
 
         // Footer, read from the end.
-        let mut footer = [0u8; FOOTER_SIZE as usize];
+        let mut footer = [0u8; FOOTER_LEN];
         pread_exact(&file, &mut footer, file_len - FOOTER_SIZE)
             .map_err(|e| Error::io("read run footer", e))?;
-        if &footer[28..36] != MAGIC {
-            return Err(Error::corruption("bad magic; not an lsm-db sorted run"));
-        }
-        let entry_count = u64::from_le_bytes(arr8(&footer[0..8]));
-        let index_offset = u64::from_le_bytes(arr8(&footer[8..16]));
-        let index_len = u64::from_le_bytes(arr8(&footer[16..24]));
-        let index_crc = u32::from_le_bytes(arr4(&footer[24..28]));
-
-        if index_offset < MAGIC.len() as u64
-            || index_offset
-                .checked_add(index_len)
-                .is_none_or(|end| end != file_len - FOOTER_SIZE)
-        {
-            return Err(Error::corruption(
-                "index extent inconsistent with file size",
-            ));
-        }
+        let Footer {
+            entry_count,
+            index_offset,
+            index_len,
+            index_crc,
+        } = Footer::parse(&footer, file_len)?;
 
         // Index block.
         let mut index_bytes = vec![0u8; usize_of(index_len)?];
         pread_exact(&file, &mut index_bytes, index_offset)
             .map_err(|e| Error::io("read run index", e))?;
-        if crc32c::crc32c(&index_bytes) != index_crc {
+        if crc32c(&index_bytes) != index_crc {
             return Err(Error::corruption("index checksum mismatch"));
         }
 
-        let index = parse_index(&index_bytes)?;
+        let index = parse_index(&index_bytes, index_offset)?;
         Ok(SsTable {
             file,
             path: path.to_path_buf(),
@@ -279,7 +255,7 @@ impl SsTable {
         let mut buf = vec![0u8; handle.len as usize];
         pread_exact(&self.file, &mut buf, handle.offset)
             .map_err(|e| Error::io("read data block", e))?;
-        if crc32c::crc32c(&buf) != handle.crc {
+        if crc32c(&buf) != handle.crc {
             return Err(Error::corruption("data block checksum mismatch"));
         }
         decode_block(&buf)
@@ -415,23 +391,11 @@ impl SsTableWriter {
 
     /// Append one entry. Keys must arrive in strictly ascending order.
     pub(crate) fn push(&mut self, key: &[u8], record: &Record) -> Result<()> {
-        let key_len = u32::try_from(key.len())
-            .map_err(|_| Error::corruption("key longer than u32 length prefix"))?;
-        encode_u32(&mut self.block_buf, key_len);
-        self.block_buf.extend_from_slice(key);
-        match record {
-            Record::Value(value) => {
-                let val_len = u32::try_from(value.len())
-                    .map_err(|_| Error::corruption("value longer than u32 length prefix"))?;
-                self.block_buf.push(TAG_VALUE);
-                encode_u32(&mut self.block_buf, val_len);
-                self.block_buf.extend_from_slice(value);
-            }
-            Record::Tombstone => {
-                self.block_buf.push(TAG_TOMBSTONE);
-                encode_u32(&mut self.block_buf, 0);
-            }
-        }
+        // The engine's write methods already enforce these limits; checking
+        // again here guarantees a run is never written that a reader rejects.
+        let entry = record.as_entry();
+        format::check_lengths(key, entry)?;
+        format::encode_entry(&mut self.block_buf, key, entry);
         self.block_last_key.clear();
         self.block_last_key.extend_from_slice(key);
         self.entry_count += 1;
@@ -447,7 +411,7 @@ impl SsTableWriter {
         if self.block_buf.is_empty() {
             return Ok(());
         }
-        let crc = crc32c::crc32c(&self.block_buf);
+        let crc = crc32c(&self.block_buf);
         let len = u32::try_from(self.block_buf.len())
             .map_err(|_| Error::corruption("data block larger than u32"))?;
         self.out
@@ -471,26 +435,21 @@ impl SsTableWriter {
         let index_offset = self.offset;
         let mut index_bytes = Vec::new();
         for handle in &self.index {
-            let key_len = u32::try_from(handle.last_key.len())
-                .map_err(|_| Error::corruption("index key longer than u32"))?;
-            encode_u32(&mut index_bytes, key_len);
-            index_bytes.extend_from_slice(&handle.last_key);
-            index_bytes.extend_from_slice(&handle.offset.to_le_bytes());
-            index_bytes.extend_from_slice(&handle.len.to_le_bytes());
-            index_bytes.extend_from_slice(&handle.crc.to_le_bytes());
+            format::encode_index_entry(
+                &mut index_bytes,
+                &handle.last_key,
+                handle.offset,
+                handle.len,
+                handle.crc,
+            );
         }
-        let index_crc = crc32c::crc32c(&index_bytes);
+        let index_crc = crc32c(&index_bytes);
         let index_len = index_bytes.len() as u64;
         self.out
             .write_all(&index_bytes)
             .map_err(|e| Error::io("write run index", e))?;
 
-        let mut footer = Vec::with_capacity(FOOTER_SIZE as usize);
-        footer.extend_from_slice(&self.entry_count.to_le_bytes());
-        footer.extend_from_slice(&index_offset.to_le_bytes());
-        footer.extend_from_slice(&index_len.to_le_bytes());
-        footer.extend_from_slice(&index_crc.to_le_bytes());
-        footer.extend_from_slice(MAGIC);
+        let footer = format::encode_footer(self.entry_count, index_offset, index_len, index_crc);
         self.out
             .write_all(&footer)
             .map_err(|e| Error::io("write run footer", e))?;
@@ -505,130 +464,29 @@ impl SsTableWriter {
     }
 }
 
-/// Decode an index block into block handles, validating bounds and ordering.
-fn parse_index(bytes: &[u8]) -> Result<Vec<BlockHandle>> {
-    let mut handles = Vec::new();
-    let mut pos = 0usize;
-    let mut prev: Option<Vec<u8>> = None;
-    while pos < bytes.len() {
-        let key_len = read_u32_at(bytes, &mut pos)?;
-        if key_len > MAX_RECORD_LEN {
-            return Err(Error::corruption("index key length exceeds maximum"));
-        }
-        let last_key = read_bytes_at(bytes, &mut pos, key_len as usize)?;
-        let offset = u64::from_le_bytes(read_array_at::<8>(bytes, &mut pos)?);
-        let len = u32::from_le_bytes(read_array_at::<4>(bytes, &mut pos)?);
-        let crc = u32::from_le_bytes(read_array_at::<4>(bytes, &mut pos)?);
-        if let Some(ref p) = prev {
-            if last_key.as_slice() <= p.as_slice() {
-                return Err(Error::corruption(
-                    "index block keys not strictly increasing",
-                ));
-            }
-        }
-        prev = Some(last_key.clone());
-        handles.push(BlockHandle {
-            last_key,
-            offset,
-            len,
-            crc,
-        });
-    }
-    Ok(handles)
+/// Decode an index block into block handles, validating bounds, ordering, and
+/// that every block lies inside the data region `[8, data_end)`.
+fn parse_index(bytes: &[u8], data_end: u64) -> Result<Vec<BlockHandle>> {
+    IndexEntries::new(bytes, data_end)
+        .map(|entry| {
+            entry.map(|e| BlockHandle {
+                last_key: e.last_key.to_vec(),
+                offset: e.offset,
+                len: e.len,
+                crc: e.crc,
+            })
+        })
+        .collect()
 }
 
 /// Decode a data block into its entries, validating bounds and ordering.
-fn decode_block(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Record)>> {
+fn decode_block(bytes: &[u8]) -> Result<DecodedBlock> {
     let mut entries = Vec::new();
-    let mut pos = 0usize;
-    let mut prev: Option<Vec<u8>> = None;
-    while pos < bytes.len() {
-        let key_len = read_u32_at(bytes, &mut pos)?;
-        if key_len > MAX_RECORD_LEN {
-            return Err(Error::corruption("key length exceeds maximum"));
-        }
-        let key = read_bytes_at(bytes, &mut pos, key_len as usize)?;
-        let tag = read_u8_at(bytes, &mut pos)?;
-        let val_len = read_u32_at(bytes, &mut pos)?;
-        if val_len > MAX_RECORD_LEN {
-            return Err(Error::corruption("value length exceeds maximum"));
-        }
-        let record = match tag {
-            TAG_VALUE => Record::Value(read_bytes_at(bytes, &mut pos, val_len as usize)?),
-            TAG_TOMBSTONE => {
-                if val_len != 0 {
-                    return Err(Error::corruption("tombstone with non-zero value length"));
-                }
-                Record::Tombstone
-            }
-            _ => return Err(Error::corruption("unknown record tag")),
-        };
-        if let Some(ref p) = prev {
-            if key.as_slice() <= p.as_slice() {
-                return Err(Error::corruption("data block keys not strictly increasing"));
-            }
-        }
-        prev = Some(key.clone());
-        entries.push((key, record));
+    for item in BlockEntries::new(bytes) {
+        let (key, entry) = item?;
+        entries.push((key.to_vec(), Record::from(entry)));
     }
     Ok(entries)
-}
-
-#[inline]
-fn encode_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
-
-#[inline]
-fn read_u8_at(bytes: &[u8], pos: &mut usize) -> Result<u8> {
-    let b = *bytes
-        .get(*pos)
-        .ok_or_else(|| Error::corruption("record truncated"))?;
-    *pos += 1;
-    Ok(b)
-}
-
-#[inline]
-fn read_u32_at(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(read_array_at::<4>(bytes, pos)?))
-}
-
-fn read_array_at<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N]> {
-    let end = pos
-        .checked_add(N)
-        .ok_or_else(|| Error::corruption("record extent overflows"))?;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::corruption("record truncated"))?;
-    let mut arr = [0u8; N];
-    arr.copy_from_slice(slice);
-    *pos = end;
-    Ok(arr)
-}
-
-fn read_bytes_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<Vec<u8>> {
-    let end = pos
-        .checked_add(len)
-        .ok_or_else(|| Error::corruption("record extent overflows"))?;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::corruption("record truncated"))?;
-    *pos = end;
-    Ok(slice.to_vec())
-}
-
-#[inline]
-fn arr8(s: &[u8]) -> [u8; 8] {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(s);
-    a
-}
-
-#[inline]
-fn arr4(s: &[u8]) -> [u8; 4] {
-    let mut a = [0u8; 4];
-    a.copy_from_slice(s);
-    a
 }
 
 /// Convert an on-disk `u64` length to `usize`, rejecting values too large for
@@ -816,5 +674,90 @@ mod tests {
         let t = SsTable::open(&path).unwrap();
         drop(t);
         assert!(path.exists());
+    }
+
+    /// The in-memory `RunWriter` and the engine's file writer must produce the
+    /// same bytes, and each side must read what the other wrote.
+    #[test]
+    fn test_file_writer_and_run_writer_are_byte_identical() {
+        use crate::format::{Entry, RunReader, RunWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.sst");
+        let mut entries = Vec::new();
+        for i in 0..3_000u32 {
+            let key = format!("key{i:06}").into_bytes();
+            let rec = if i % 7 == 0 {
+                Record::Tombstone
+            } else {
+                val(&vec![b'v'; (i % 300) as usize])
+            };
+            entries.push((key, rec));
+        }
+        let refs: Vec<(&[u8], Record)> = entries
+            .iter()
+            .map(|(k, r)| (k.as_slice(), r.clone()))
+            .collect();
+        write_run(&path, &refs);
+
+        let mut w = RunWriter::new();
+        for (k, r) in &entries {
+            match r {
+                Record::Value(v) => w.put(k, v).unwrap(),
+                Record::Tombstone => w.delete(k).unwrap(),
+            }
+        }
+        let in_memory = w.finish();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(in_memory, on_disk);
+
+        // RunReader reads the engine's file ...
+        let run = RunReader::new(&on_disk).unwrap();
+        assert_eq!(run.entry_count(), 3_000);
+        let read: Vec<(Vec<u8>, Record)> = run
+            .iter()
+            .map(|r| {
+                let (k, e) = r.unwrap();
+                (k.to_vec(), Record::from(e))
+            })
+            .collect();
+        assert_eq!(read, entries);
+        assert_eq!(run.get(b"key000007").unwrap(), Some(Entry::Tombstone));
+
+        // ... and the engine opens the RunWriter's output.
+        let path2 = dir.path().join("run2.sst");
+        std::fs::write(&path2, &in_memory).unwrap();
+        let t = SsTable::open(&path2).unwrap();
+        assert_eq!(count(&t), 3_000);
+        assert_eq!(t.lookup(b"key000001").unwrap(), Some(val(b"v")));
+        assert_eq!(t.lookup(b"key000007").unwrap(), Some(Record::Tombstone));
+    }
+
+    #[test]
+    fn test_index_pointing_outside_data_region_is_corruption() {
+        use crate::format::{Entry, encode_entry, encode_footer, encode_index_entry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.sst");
+        let mut out = MAGIC.to_vec();
+        let mut block = Vec::new();
+        encode_entry(&mut block, b"k", Entry::Value(b"v"));
+        out.extend_from_slice(&block);
+        let index_offset = out.len() as u64;
+        let mut index = Vec::new();
+        // Claims the block runs into the index.
+        encode_index_entry(&mut index, b"k", 8, block.len() as u32 + 4, crc32c(&block));
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&encode_footer(
+            1,
+            index_offset,
+            index.len() as u64,
+            crc32c(&index),
+        ));
+        std::fs::write(&path, &out).unwrap();
+        assert!(matches!(
+            SsTable::open(&path),
+            Err(Error::Corruption { .. })
+        ));
     }
 }

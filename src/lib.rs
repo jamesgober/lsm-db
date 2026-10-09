@@ -74,15 +74,59 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std` | yes | Standard library. The engine requires it. |
-//! | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. |
-//! | `bloom` | no | Bloom-filtered point lookups via `bloom-lib`. |
+//! | `std` | yes | Standard library. The engine (`Lsm`, `LsmConfig`, `Batch`, `Scan`) requires it. Implies `alloc`, and adds the `error-forge` integration and run-time CRC32C hardware detection. |
+//! | `alloc` | via `std` | Heap allocation without `std`: the [`format`](mod@format) codec (`RunWriter`, `RunReader`). |
+//! | `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. Implies `std`. |
+//! | `bloom` | no | Bloom-filtered point lookups via `bloom-lib`. Implies `std`. |
+//!
+//! ## `no_std`
+//!
+//! With `default-features = false` the crate builds on bare-metal targets. The
+//! storage engine needs a filesystem and stays behind `std`; what remains is
+//! the on-disk format itself. Without any feature that is [`format::crc32c`],
+//! [`Error`], and [`Result`]; with `alloc` it adds [`format::RunWriter`] and
+//! [`format::RunReader`], which write and read sorted runs in memory,
+//! byte-compatible with the files the engine writes.
+//!
+//! ```toml
+//! [dependencies]
+//! lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+//! ```
+//!
+//! CRC32C is part of the format, so every build computes identical checksums.
+//! With `std` they come from the `crc32c` crate, which detects SSE4.2 or the
+//! ARMv8 CRC extension at run time. Without `std` there is no run-time
+//! detection: the hardware instructions are used when the target enables them
+//! at compile time (`-C target-feature=+sse4.2` on x86_64, `+crc` on aarch64)
+//! and a slicing-by-8 table otherwise.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(warnings)]
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// No `unsafe` anywhere, except the CRC32C intrinsics a `no_std` build uses when
+// its target enables them at compile time (see `src/crc.rs`). Every other build,
+// including the default `std` one, forbids it outright.
+#![cfg_attr(
+    not(all(
+        not(feature = "std"),
+        any(
+            all(target_arch = "x86_64", target_feature = "sse4.2"),
+            all(target_arch = "aarch64", target_feature = "crc")
+        )
+    )),
+    forbid(unsafe_code)
+)]
+#![cfg_attr(
+    all(
+        not(feature = "std"),
+        any(
+            all(target_arch = "x86_64", target_feature = "sse4.2"),
+            all(target_arch = "aarch64", target_feature = "crc")
+        )
+    ),
+    deny(unsafe_code)
+)]
 #![deny(unused_must_use)]
 #![deny(unused_results)]
 #![deny(clippy::unwrap_used)]
@@ -94,6 +138,11 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
 
+#[cfg(any(feature = "alloc", test))]
+extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
+
 #[cfg(feature = "std")]
 mod batch;
 #[cfg(feature = "std")]
@@ -102,12 +151,13 @@ mod bloom;
 mod cache;
 #[cfg(feature = "std")]
 mod config;
+mod crc;
 #[cfg(feature = "std")]
 mod db;
 #[cfg(feature = "std")]
 mod durability;
-#[cfg(feature = "std")]
 mod error;
+pub mod format;
 #[cfg(feature = "std")]
 mod manifest;
 #[cfg(feature = "std")]
@@ -129,7 +179,6 @@ pub use crate::config::{
 };
 #[cfg(feature = "std")]
 pub use crate::db::Lsm;
-#[cfg(feature = "std")]
 pub use crate::error::{Error, Result};
 #[cfg(feature = "std")]
 pub use crate::scan::Scan;

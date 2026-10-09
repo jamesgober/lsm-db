@@ -1,23 +1,31 @@
 //! The crate error type.
 //!
 //! Every fallible operation in `lsm-db` returns [`Result<T>`], whose error is
-//! [`Error`]. The type integrates with the portfolio's `error-forge` framework
-//! — it implements [`error_forge::ForgeError`], so callers get the stable
-//! `kind` / `caption` / `is_fatal` metadata other crates rely on — while still
-//! exposing the underlying [`std::io::Error`] through
-//! [`std::error::Error::source`] for code that needs the OS error kind directly.
+//! [`Error`]. With `std` (the default) the type integrates with the
+//! portfolio's `error-forge` framework: it implements `error_forge::ForgeError`,
+//! so callers get the stable `kind` / `caption` / `is_fatal` metadata other
+//! crates rely on, while still exposing the underlying `std::io::Error` through
+//! [`source`](core::error::Error::source) for code that needs the OS error kind
+//! directly.
+//!
+//! Without `std` the type is the same minus the `Io` variant, and it implements
+//! [`core::error::Error`].
 
-use std::{fmt, io};
+use core::fmt;
+#[cfg(feature = "std")]
+use std::io;
 
+#[cfg(feature = "std")]
 use error_forge::ForgeError;
 
-/// A specialised [`Result`](std::result::Result) for storage-engine operations.
+/// A specialised [`Result`](core::result::Result) for storage-engine operations.
 ///
 /// Defaults its error to [`Error`], so most signatures read `Result<T>`.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// Everything that can go wrong while opening, reading from, writing to, or
-/// flushing an [`Lsm`](crate::Lsm) engine.
+/// flushing an `Lsm` engine, or while encoding or decoding a run with
+/// [`format`](crate::format).
 ///
 /// The type is
 /// [`#[non_exhaustive]`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute):
@@ -31,9 +39,12 @@ pub enum Error {
     /// `context` names the operation that was attempted (for example
     /// `"open database directory"` or `"flush memtable to disk"`) so the
     /// message is actionable without a backtrace. The original [`io::Error`] is
-    /// preserved as the [`source`](std::error::Error::source); inspect it when
+    /// preserved as the [`source`](core::error::Error::source); inspect it when
     /// the OS error kind (disk full, permission denied, not found) drives the
     /// recovery decision.
+    ///
+    /// Only present with the `std` feature.
+    #[cfg(feature = "std")]
     Io {
         /// What the engine was trying to do when the I/O error occurred.
         context: &'static str,
@@ -51,38 +62,63 @@ pub enum Error {
         /// A short, human-readable reason the run was rejected.
         reason: &'static str,
     },
+
+    /// The caller passed something the format cannot store.
+    ///
+    /// Returned before anything is written when a key is longer than
+    /// [`MAX_KEY_LEN`](crate::format::MAX_KEY_LEN) or a value is longer than
+    /// [`MAX_VALUE_LEN`](crate::format::MAX_VALUE_LEN), and by
+    /// [`RunWriter`](crate::format::RunWriter) when keys are not added in
+    /// strictly ascending order. Nothing was changed; fix the input and retry.
+    InvalidInput {
+        /// A short, human-readable reason the input was rejected.
+        reason: &'static str,
+    },
 }
 
 impl Error {
     /// Wrap an [`io::Error`] with the static context describing the operation.
+    #[cfg(feature = "std")]
     pub(crate) fn io(context: &'static str, source: io::Error) -> Self {
         Error::Io { context, source }
     }
 
+    #[cfg(feature = "alloc")]
     /// Build an [`Error::Corruption`] with a static reason.
     pub(crate) fn corruption(reason: &'static str) -> Self {
         Error::Corruption { reason }
+    }
+
+    #[cfg(feature = "alloc")]
+    /// Build an [`Error::InvalidInput`] with a static reason.
+    pub(crate) fn invalid_input(reason: &'static str) -> Self {
+        Error::InvalidInput { reason }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "std")]
             Error::Io { context, source } => {
                 write!(f, "i/o error while {context}: {source}")
             }
             Error::Corruption { reason } => {
                 write!(f, "sorted-run corruption: {reason}")
             }
+            Error::InvalidInput { reason } => {
+                write!(f, "invalid input: {reason}")
+            }
         }
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for Error {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "std")]
             Error::Io { source, .. } => Some(source),
-            Error::Corruption { .. } => None,
+            Error::Corruption { .. } | Error::InvalidInput { .. } => None,
         }
     }
 }
@@ -92,6 +128,7 @@ impl std::error::Error for Error {
 /// Call sites that know what they were doing attach a specific context instead;
 /// this exists for the `?` ergonomics of code — including doctests and examples
 /// — that does not.
+#[cfg(feature = "std")]
 impl From<io::Error> for Error {
     fn from(source: io::Error) -> Self {
         Error::Io {
@@ -101,11 +138,15 @@ impl From<io::Error> for Error {
     }
 }
 
+/// The `error-forge` integration. Only with the `std` feature, because
+/// `error-forge` requires the standard library.
+#[cfg(feature = "std")]
 impl ForgeError for Error {
     fn kind(&self) -> &'static str {
         match self {
             Error::Io { .. } => "Io",
             Error::Corruption { .. } => "Corruption",
+            Error::InvalidInput { .. } => "InvalidInput",
         }
     }
 
@@ -116,12 +157,14 @@ impl ForgeError for Error {
     /// Corruption is unrecoverable by retry: the bytes on disk are already
     /// damaged. I/O errors are left non-fatal for the caller to judge — a
     /// transient `Interrupted` or a recoverable `WouldBlock` may be retried.
+    /// Invalid input is not fatal either: nothing was written, and corrected
+    /// input succeeds.
     fn is_fatal(&self) -> bool {
         matches!(self, Error::Corruption { .. })
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -155,6 +198,18 @@ mod tests {
         assert_eq!(Error::corruption("x").kind(), "Corruption");
         let io = Error::io("x", io::Error::from(io::ErrorKind::Other));
         assert_eq!(io.kind(), "Io");
+    }
+
+    #[test]
+    fn test_invalid_input_is_not_fatal_and_has_no_source() {
+        let err = Error::invalid_input("key longer than MAX_KEY_LEN (1 GiB)");
+        assert_eq!(err.kind(), "InvalidInput");
+        assert!(!err.is_fatal());
+        assert!(std::error::Error::source(&err).is_none());
+        assert_eq!(
+            err.to_string(),
+            "invalid input: key longer than MAX_KEY_LEN (1 GiB)"
+        );
     }
 
     #[test]

@@ -186,7 +186,7 @@ mod enabled {
             }
             let crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
             let payload = &bytes[12..];
-            if crc32c::crc32c(payload) != crc {
+            if crate::crc::crc32c(payload) != crc {
                 return None;
             }
             postcard::from_bytes::<BloomFilter<[u8]>>(payload).ok()
@@ -200,7 +200,7 @@ mod enabled {
                 .map_err(|_| Error::corruption("failed to encode bloom sidecar"))?;
             let mut bytes = Vec::with_capacity(12 + payload.len());
             bytes.extend_from_slice(SIDECAR_MAGIC);
-            bytes.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+            bytes.extend_from_slice(&crate::crc::crc32c(&payload).to_le_bytes());
             bytes.extend_from_slice(&payload);
 
             let mut tmp = path.clone().into_os_string();

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "1.0.0"
+version = "1.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -69,14 +69,19 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # #################################
 [features]
 default = ["std"]
-# Standard library.
-std = []
+# Standard library: the storage engine, the `error-forge` integration, and
+# run-time CRC32C hardware detection via `crc32c`.
+std = ["alloc", "dep:crc32c", "dep:error-forge"]
+# Heap allocation without `std`: the in-memory run codec (`format::RunWriter`,
+# `format::RunReader`). Without it a `no_std` build still has `format::crc32c`
+# and the error type.
+alloc = []
 # Crash-safe memtable durability via `wal-db`.
-durability = ["dep:wal-db"]
+durability = ["std", "dep:wal-db"]
 # Bloom-filtered SSTable point lookups: a per-run filter (persisted in a
 # sidecar file via `postcard`) lets a point read skip any run that cannot
 # contain the key.
-bloom = ["dep:bloom-lib", "dep:postcard"]
+bloom = ["std", "dep:bloom-lib", "dep:postcard"]
 
 
 # DEPENDENCIES
@@ -84,15 +89,17 @@ bloom = ["dep:bloom-lib", "dep:postcard"]
 [dependencies]
 # Domain error type. Portfolio crates standardise on `error-forge` for stable
 # error metadata (kind/caption/is_fatal) instead of thiserror/anyhow. Default
-# features are off — only the `ForgeError` trait is needed.
-error-forge = { version = "1.0", default-features = false }
+# features are off — only the `ForgeError` trait is needed. It requires `std`,
+# so it is pulled in by the `std` feature.
+error-forge = { version = "1.0", optional = true, default-features = false }
 
 # Hardware-accelerated CRC32C (Castagnoli) for sorted-run integrity: per-block
-# and index checksums in the on-disk format. Uses the SSE4.2 `crc32` instruction
-# on x86_64 and the CRC extension on aarch64, with a software fallback. Same
-# choice as `wal-db`; rolling it by hand would re-implement the intrinsics with
-# no upside.
-crc32c = "0.6"
+# and index checksums in the on-disk format. Picks the SSE4.2 `crc32`
+# instruction on x86_64 or the CRC extension on aarch64 at run time, with a
+# software fallback. Same choice as `wal-db`. Run-time CPU detection needs
+# `std`, so `no_std` builds use the compile-time implementation in `src/crc.rs`
+# instead; both produce identical checksums.
+crc32c = { version = "0.6", optional = true }
 
 # First-party primitives, each behind its own additive feature flag: durability
 # (0.4) and bloom (0.5). Optional so the default build pulls neither.
@@ -109,6 +116,9 @@ postcard  = { version = "1", optional = true, default-features = false, features
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# Reference implementation for the CRC32C tests and benchmark, so the `no_std`
+# paths are checked against it even when the `std` feature is off.
+crc32c    = "0.6"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tempfile  = "3"
@@ -143,6 +153,10 @@ harness = false
 
 [[bench]]
 name    = "comparison"
+harness = false
+
+[[bench]]
+name    = "crc"
 harness = false
 
 

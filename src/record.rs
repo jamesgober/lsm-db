@@ -29,3 +29,24 @@ impl Record {
         }
     }
 }
+
+impl Record {
+    /// The record as a borrowed format [`Entry`](crate::format::Entry).
+    #[inline]
+    pub(crate) fn as_entry(&self) -> crate::format::Entry<'_> {
+        match self {
+            Record::Value(v) => crate::format::Entry::Value(v),
+            Record::Tombstone => crate::format::Entry::Tombstone,
+        }
+    }
+}
+
+impl From<crate::format::Entry<'_>> for Record {
+    #[inline]
+    fn from(entry: crate::format::Entry<'_>) -> Self {
+        match entry {
+            crate::format::Entry::Value(v) => Record::Value(v.to_vec()),
+            crate::format::Entry::Tombstone => Record::Tombstone,
+        }
+    }
+}

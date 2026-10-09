@@ -29,6 +29,9 @@
 cargo bench --bench lsm_bench                          # lsm-db hot paths
 cargo bench --bench lsm_bench --features bloom         # with bloom filters
 cargo bench --bench comparison                         # vs sled and redb
+cargo bench --bench crc                                # CRC32C, std build
+cargo bench --bench crc --no-default-features --features alloc   # no_std table path
+RUSTFLAGS="-C target-feature=+sse4.2" cargo bench --bench crc --no-default-features --features alloc
 ```
 
 The numbers below were taken on Windows 11 (x86_64), Rust stable, release
@@ -96,6 +99,29 @@ Reading the table honestly:
 The takeaway matches the design: an LSM tree is built for write-heavy and
 point-read workloads, which is exactly where `lsm-db` leads; ordered range scans
 are a B-tree's home turf.
+
+---
+
+## CRC32C in every build
+
+Every data block, index block and bloom sidecar carries a CRC32C, so the
+checksum runs on every block read and write. The `std` build uses the `crc32c`
+crate, which picks the SSE4.2 or ARMv8 CRC instructions at run time; 1.1 left
+that path unchanged. A `no_std` build has no run-time CPU detection, so
+`src/crc.rs` uses the instructions when the target enables them at compile
+time and slicing-by-8 tables otherwise. From `benches/crc.rs`:
+
+| Build | 64 B | 4 KiB | 64 KiB |
+|-------|------|-------|--------|
+| `std` (`crc32c` crate) | 4.1 GiB/s | 7.6 GiB/s | 7.3 GiB/s |
+| `no_std`, `-C target-feature=+sse4.2` | 39 GiB/s | 38.7 GiB/s | 36.5 GiB/s |
+| `no_std`, table | 3.1 GiB/s | 2.6 GiB/s | 2.5 GiB/s |
+
+The hardware path runs three independent CRC streams to hide the
+instruction's latency, the same scheme as the `crc32c` crate, and matches that
+crate's throughput when both are built with the target feature. All paths
+produce identical checksums; the tests check them against the `crc32c` crate
+and the published check values.
 
 ---
 

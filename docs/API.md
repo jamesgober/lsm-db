@@ -17,17 +17,20 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: `1.0.0`, stable. API frozen until 2.0.** The surface below is frozen
+> **Status: `1.1.0`, stable. API frozen until 2.0.** The surface below is frozen
 > — no breaking change — over a multi-run engine with background compaction, a
 > block cache, optional crash-safe writes (`durability`), and optional
 > bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x
-> series ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)).
+> series ([`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md)). Since 1.1 the format
+> is also available as an in-memory codec, [`format`](#format), which builds
+> without `std`.
 
 <h4 id="example-pointers">Example Pointers</h4>
 
 - Embedded KV: `examples/embedded_kv.rs` — open, put, get, overwrite, delete, flush.
 - Range scan: `examples/range_scan.rs` — full, bounded, and prefix scans in key order.
 - Batch writes: `examples/batch_writes.rs` — grouped atomic writes and reopen.
+- Run codec: `examples/run_codec.rs` — read a flushed run file and build a run in memory with `format`.
 
 <br>
 
@@ -55,9 +58,16 @@
   - [`Scan`](#scan)
   - [`Error` & `Result`](#error--result)
   - [`prelude`](#prelude)
+  - [`format`](#format)
+    - [`RunWriter`](#runwriter)
+    - [`RunReader`](#runreader)
+    - [`Entry`](#entry)
+    - [`crc32c`](#crc32c)
+    - [`MAX_KEY_LEN` & `MAX_VALUE_LEN`](#max_key_len--max_value_len)
 - [Concurrency](#concurrency)
 - [Durability & persistence](#durability--persistence)
 - [Feature flags](#feature-flags)
+- [`no_std`](#no_std)
 
 ---
 
@@ -65,11 +75,12 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.0"
+lsm-db = "1.1"
 ```
 
 The engine requires the standard library, which is on by default. See
-[Feature flags](#feature-flags) for the optional first-party integrations.
+[Feature flags](#feature-flags) for the optional first-party integrations, and
+[`no_std`](#no_std) for bare-metal targets.
 
 ---
 
@@ -225,6 +236,10 @@ capacity.
   into the engine, so the caller's buffer is free to reuse.
 - `value` — the value bytes (`AsRef<[u8]>`). Empty values are allowed.
 
+**Errors** `Error::InvalidInput` if the key or value is longer than
+[`MAX_KEY_LEN` / `MAX_VALUE_LEN`](#max_key_len--max_value_len) (1 GiB each);
+nothing is written. `Error::Io` if logging the write or a resulting flush fails.
+
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let dir = tempfile::tempdir()?;
@@ -283,6 +298,9 @@ masks any older on-disk value until a flush resolves it away.
 
 - `key` — the key bytes (`AsRef<[u8]>`).
 
+**Errors** `Error::InvalidInput` if the key is longer than
+[`MAX_KEY_LEN`](#max_key_len--max_value_len); nothing is written.
+
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let dir = tempfile::tempdir()?;
@@ -316,6 +334,9 @@ operation on a key overrides an earlier one.
 **Parameters**
 
 - `batch` — the [`Batch`](#batch) to apply; consumed by the call.
+
+**Errors** `Error::InvalidInput` if any key or value in the batch is over
+[the limit](#max_key_len--max_value_len); none of the batch is written.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -597,12 +618,14 @@ assert_eq!(reverse, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
 ### `Error` & `Result`
 
 ```rust
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 #[non_exhaustive]
 pub enum Error {
+    #[cfg(feature = "std")]
     Io { context: &'static str, source: std::io::Error },
     Corruption { reason: &'static str },
+    InvalidInput { reason: &'static str },
 }
 ```
 
@@ -611,14 +634,17 @@ so a `match` over it must include a wildcard arm.
 
 | Variant | Meaning | Caller action |
 |---------|---------|---------------|
-| `Io` | An underlying I/O operation failed. `context` names what was attempted; the original `io::Error` is the [`source`](https://doc.rust-lang.org/std/error/trait.Error.html#method.source). | Inspect the OS error kind (disk full, permission denied) via the source. May be retryable. |
-| `Corruption` | An on-disk run is not intact (bad magic, implausible length, truncation). | Not retryable; the bytes on disk are damaged. |
+| `Io` | An underlying I/O operation failed. `context` names what was attempted; the original `io::Error` is the [`source`](https://doc.rust-lang.org/std/error/trait.Error.html#method.source). Only with `std`. | Inspect the OS error kind (disk full, permission denied) via the source. May be retryable. |
+| `Corruption` | An on-disk run is not intact (bad magic, implausible length, truncation, checksum mismatch). | Not retryable; the bytes on disk are damaged. |
+| `InvalidInput` | The caller passed something the format cannot store: a key or value over 1 GiB, or keys out of order in a [`RunWriter`](#runwriter). Nothing was written. *(since 1.1)* | Fix the input and retry. |
 
-`Error` implements `std::error::Error`, `Display`, and
+`Error` implements `core::error::Error` (the same trait as `std::error::Error`)
+and `Display`. With `std` it also implements
 [`error_forge::ForgeError`](https://docs.rs/error-forge) — `kind()` returns
-`"Io"` / `"Corruption"`, `caption()` returns `"lsm storage engine error"`, and
-`is_fatal()` is `true` only for `Corruption`. A bare `std::io::Error` converts
-into `Error::Io` via `From`, for `?` ergonomics.
+`"Io"` / `"Corruption"` / `"InvalidInput"`, `caption()` returns
+`"lsm storage engine error"`, and `is_fatal()` is `true` only for `Corruption`
+— and a bare `std::io::Error` converts into `Error::Io` via `From`, for `?`
+ergonomics.
 
 ```rust
 use lsm_db::Error;
@@ -659,6 +685,137 @@ fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+---
+
+### `format`
+
+```rust
+pub mod format { /* RunWriter, RunReader, RunIter, Entry, crc32c, MAX_KEY_LEN, MAX_VALUE_LEN */ }
+```
+
+The sorted-run format of
+[`docs/SSTABLE_FORMAT.md`](./SSTABLE_FORMAT.md) as an in-memory codec, over
+byte buffers instead of files. It is the part of the crate that works without
+`std`: `crc32c`, `Entry`, and the limits need nothing; `RunWriter` and
+`RunReader` need the `alloc` feature (implied by `std`). A run built with
+`RunWriter` is byte-for-byte what the engine writes for the same entries, and
+`RunReader` reads the run files the engine writes, so runs can move between a
+host and a device in either direction. *(since 1.1)*
+
+#### `RunWriter`
+
+```rust
+pub struct RunWriter { /* ... */ }
+
+impl RunWriter {
+    pub fn new() -> RunWriter;
+    pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()>;
+    pub fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<()>;
+    pub fn entry_count(&self) -> u64;
+    pub fn finish(self) -> Vec<u8>;
+}
+```
+
+Builds a run in memory. Add entries with `put` (a value) and `delete` (a
+tombstone) in **strictly ascending** key order, then `finish` for the encoded
+run. An out-of-order or duplicate key, or a key or value over the limit, returns
+`Error::InvalidInput` and leaves the writer unchanged. `RunWriter` is also
+`Default`, `Clone`, and `Debug`.
+
+```rust
+use lsm_db::format::{Entry, RunReader, RunWriter};
+
+let mut writer = RunWriter::new();
+writer.put(b"apple", b"red")?;
+writer.delete(b"banana")?;
+assert!(writer.put(b"aardvark", b"x").is_err()); // out of order
+let bytes = writer.finish();
+
+let run = RunReader::new(&bytes)?;
+assert_eq!(run.get(b"banana")?, Some(Entry::Tombstone));
+# Ok::<(), lsm_db::Error>(())
+```
+
+#### `RunReader`
+
+```rust
+pub struct RunReader<'a> { /* ... */ }
+
+impl<'a> RunReader<'a> {
+    pub fn new(bytes: &'a [u8]) -> Result<RunReader<'a>>;
+    pub fn entry_count(&self) -> u64;
+    pub fn get(&self, key: &[u8]) -> Result<Option<Entry<'a>>>;
+    pub fn iter(&self) -> RunIter<'a, '_>;
+}
+```
+
+A validated run held in memory. `new` checks the header and footer magic, the
+index extent, the index checksum, and every index entry (order and block
+extents), returning `Error::Corruption` on any failure. `get` reads, verifies,
+and scans the one block that could hold the key. `iter` (also `&RunReader:
+IntoIterator`) yields `Result<(&'a [u8], Entry<'a>)>` in key order, verifying
+each block's checksum as it reaches it, and also checks that keys keep
+increasing across blocks and that each block ends with the key the index
+records; it yields the first error and then ends. Keys and values borrow from
+the buffer; nothing is copied. `entry_count` is the footer's informational
+count.
+
+```rust
+use lsm_db::format::{RunReader, RunWriter};
+
+let mut writer = RunWriter::new();
+for i in 0..1_000u32 {
+    writer.put(format!("k{i:04}"), i.to_le_bytes())?;
+}
+let bytes = writer.finish();
+
+let run = RunReader::new(&bytes)?;
+assert_eq!(run.entry_count(), 1_000);
+assert_eq!(run.iter().filter(|r| r.is_ok()).count(), 1_000);
+assert!(run.get(b"k9999")?.is_none());
+# Ok::<(), lsm_db::Error>(())
+```
+
+#### `Entry`
+
+```rust
+pub enum Entry<'a> {
+    Value(&'a [u8]),
+    Tombstone,
+}
+```
+
+What a key maps to in one run. A `Tombstone` records a deletion and must shadow
+older runs. `value()` returns `Option<&'a [u8]>` and `is_tombstone()` tells the
+two apart. `Copy`, `Eq`, `Hash`, and `Debug`.
+
+#### `crc32c`
+
+```rust
+pub fn crc32c(data: &[u8]) -> u32
+```
+
+The CRC32C (Castagnoli) checksum the format uses. With `std` it runs on the
+`crc32c` crate, which picks the SSE4.2 or ARMv8 CRC instructions at run time.
+Without `std` it uses those instructions when the target enables them at compile
+time (`-C target-feature=+sse4.2` on x86_64, `+crc` on aarch64), and
+slicing-by-8 tables otherwise. Every path returns the same value.
+
+```rust
+assert_eq!(lsm_db::format::crc32c(b"123456789"), 0xE306_9283);
+```
+
+#### `MAX_KEY_LEN` & `MAX_VALUE_LEN`
+
+```rust
+pub const MAX_KEY_LEN: usize = 1 << 30;
+pub const MAX_VALUE_LEN: usize = 1 << 30;
+```
+
+The longest key and value the format stores (1 GiB each). `Lsm::put`,
+`Lsm::delete`, `Lsm::write`, and `RunWriter` reject anything longer with
+`Error::InvalidInput`.
 
 ---
 
@@ -719,7 +876,7 @@ that gap:
 
 ```toml
 [dependencies]
-lsm-db = { version = "0.9", features = ["durability"] }
+lsm-db = { version = "1.1", features = ["durability"] }
 ```
 
 With it on, every `put` / `delete` / `write` is appended to a `wal-db`
@@ -758,7 +915,7 @@ block:
 
 ```toml
 [dependencies]
-lsm-db = { version = "0.9", features = ["bloom"] }
+lsm-db = { version = "1.1", features = ["bloom"] }
 ```
 
 The win is on negative lookups across many runs: in a benchmark of misses over
@@ -791,11 +948,42 @@ assert_eq!(db.get(b"absent")?, None);
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | yes | Standard library. The engine requires it. |
-| `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. See [above](#crash-safe-writes-durability-feature). |
-| `bloom` | no | Per-run bloom filters that skip runs on point reads. See [above](#bloom-filtered-reads-bloom-feature). |
+| `std` | yes | Standard library. The engine requires it. Implies `alloc`; adds `Error::Io`, the `error-forge` integration, and run-time CRC32C hardware detection. |
+| `alloc` | via `std` | Heap allocation without `std`: [`RunWriter`](#runwriter) and [`RunReader`](#runreader). *(since 1.1)* |
+| `durability` | no | Crash-safe writes via a `wal-db` write-ahead log. Implies `std`. See [above](#crash-safe-writes-durability-feature). |
+| `bloom` | no | Per-run bloom filters that skip runs on point reads. Implies `std`. See [above](#bloom-filtered-reads-bloom-feature). |
 
 All features are additive: enabling one never removes functionality.
+
+---
+
+## `no_std`
+
+With `default-features = false` the crate builds on bare-metal targets (CI
+builds `thumbv7em-none-eabihf`, `riscv32imac-unknown-none-elf`, and
+`aarch64-unknown-none`). The engine needs a filesystem and stays behind `std`;
+the [`format`](#format) codec does not.
+
+```toml
+[dependencies]
+# Run codec, needs a global allocator.
+lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+# Or only crc32c, Entry, the limits, and Error, with no allocator at all.
+lsm-db = { version = "1.1", default-features = false }
+```
+
+The checksum is part of the format, so it is identical in every build. Without
+`std` there is no run-time CPU detection, so build with the target feature to
+get the hardware path:
+
+```sh
+RUSTFLAGS="-C target-feature=+crc" cargo build --target aarch64-unknown-none --no-default-features --features alloc
+```
+
+`unsafe` is forbidden in every build except a `no_std` one whose target enables
+the CRC instructions, which calls those intrinsics in four one-line blocks in
+`src/crc.rs`. Their only requirement is CPU support for the instruction, which
+the compile-time target feature guarantees.
 
 ---
 

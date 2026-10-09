@@ -37,6 +37,55 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  no-std:
+    name: no_std (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+          targets: thumbv7em-none-eabihf, riscv32imac-unknown-none-elf, aarch64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (core only, Cortex-M4F)
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features
+      - name: Build (alloc, Cortex-M4F)
+        run: cargo build --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: Build (alloc, RISC-V)
+        run: cargo build --target riscv32imac-unknown-none-elf --no-default-features --features alloc
+      - name: Build (alloc, aarch64 with hardware CRC)
+        run: cargo build --target aarch64-unknown-none --no-default-features --features alloc
+        env:
+          RUSTFLAGS: "-D warnings -C target-feature=+crc"
+      - name: Clippy (no_std)
+        run: |
+          cargo clippy --target thumbv7em-none-eabihf --no-default-features -- -D warnings
+          cargo clippy --target thumbv7em-none-eabihf --no-default-features --features alloc -- -D warnings
+          cargo clippy --lib --profile test --no-default-features --features alloc -- -D warnings
+      - name: Test without std (table CRC)
+        run: cargo test --lib --no-default-features --features alloc
+      - name: Test without std (SSE4.2 CRC)
+        run: cargo test --lib --no-default-features --features alloc
+        env:
+          RUSTFLAGS: "-D warnings -C target-feature=+sse4.2"
+
+  no-std-aarch64:
+    name: no_std tests (aarch64 hardware CRC)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Apple aarch64 targets enable the CRC extension, so this runs the
+      # hardware path of the no_std CRC32C against the crc32c crate.
+      - name: Test without std
+        run: cargo test --lib --no-default-features --features alloc
+
   loom:
     name: Loom (concurrency model check)
     runs-on: ubuntu-latest

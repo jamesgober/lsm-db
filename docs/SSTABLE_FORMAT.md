@@ -21,6 +21,11 @@
 > reads any run or manifest written by any other `1.x` release. A format change
 > requires a new version tag in the file and is a major-version event. The key
 > words MUST, MUST NOT, SHOULD, and MAY are used as in RFC 2119.
+>
+> **Implementations.** The engine reads and writes runs as files.
+> `lsm_db::format::{RunWriter, RunReader}` (since 1.1, available without `std`)
+> write and read the same bytes in memory; `RunWriter` output is byte-identical
+> to the engine's for the same entries.
 
 ## Table of Contents
 
@@ -42,8 +47,12 @@
 - All multi-byte integers are **little-endian**, unsigned.
 - `u8`, `u32`, `u64` denote 1-, 4-, and 8-byte integers.
 - Offsets and lengths are byte counts from the start of the file.
-- Checksums are **CRC32C** (Castagnoli polynomial, `0x1EDC6F41`), as produced by
-  the `crc32c` crate.
+- Checksums are **CRC32C** (Castagnoli): polynomial `0x1EDC6F41` (reflected
+  `0x82F63B78`), input and output reflected, initial value `0xFFFFFFFF`, final
+  XOR `0xFFFFFFFF`. The check value of the ASCII string `123456789` is
+  `0xE3069283`. This is the checksum of iSCSI (RFC 3720) and of the `crc32c`
+  crate; `lsm_db::format::crc32c` computes it in every build, including
+  `no_std`.
 - A *key* and a *value* are arbitrary byte strings. Within a run, keys are
   **unique** and appear in **strictly ascending** lexicographic (`memcmp`) order.
 
@@ -142,7 +151,9 @@ A reader MUST:
 2. Read the 36-byte footer and verify the trailing `magic`.
 3. Read the index block at `[index_offset, index_offset + index_len)` and verify
    its CRC32C equals `index_crc`.
-4. Parse the index into block handles, rejecting non-increasing `last_key`s.
+4. Parse the index into block handles, rejecting non-increasing `last_key`s and
+   any block whose extent `[block_offset, block_offset + block_len)` is not
+   inside the data region `[8, index_offset)`.
 
 To look up a key, binary-search the index for the first block whose `last_key`
 ≥ the key, read that block, verify its `block_crc`, and scan it. To iterate,

@@ -31,6 +31,7 @@ use crate::cache::BlockCache;
 use crate::config::LsmConfig;
 use crate::durability::Durability;
 use crate::error::{Error, Result};
+use crate::format;
 use crate::manifest::{self, Manifest};
 use crate::memtable::MemTable;
 use crate::merge::Merge;
@@ -256,6 +257,14 @@ impl Lsm {
 
     /// Set `key` to `value`, overwriting any previous value.
     ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if `key` is longer than
+    /// [`MAX_KEY_LEN`](crate::format::MAX_KEY_LEN) or `value` is longer than
+    /// [`MAX_VALUE_LEN`](crate::format::MAX_VALUE_LEN) (both 1 GiB); nothing is
+    /// written. [`Error::Io`] if logging the write (with `durability`) or a
+    /// resulting flush fails.
+    ///
     /// # Examples
     ///
     /// ```
@@ -274,6 +283,13 @@ impl Lsm {
     /// Delete `key`. A subsequent [`get`](Lsm::get) returns `None`.
     ///
     /// Deleting a key that is not present is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if `key` is longer than
+    /// [`MAX_KEY_LEN`](crate::format::MAX_KEY_LEN); nothing is written.
+    /// [`Error::Io`] if logging the delete (with `durability`) or a resulting
+    /// flush fails.
     ///
     /// # Examples
     ///
@@ -296,6 +312,14 @@ impl Lsm {
     ///
     /// The whole batch is applied under a single lock acquisition, so concurrent
     /// readers observe either none or all of it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if any key or value in the batch exceeds
+    /// [`MAX_KEY_LEN`](crate::format::MAX_KEY_LEN) /
+    /// [`MAX_VALUE_LEN`](crate::format::MAX_VALUE_LEN); none of the batch is
+    /// written. [`Error::Io`] if logging the batch (with `durability`) or a
+    /// resulting flush fails.
     ///
     /// # Examples
     ///
@@ -442,6 +466,10 @@ impl Drop for Lsm {
 
 impl Engine {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Reject what the run format cannot store before anything is logged
+        // or buffered; otherwise the write would succeed and the flushed run
+        // would later read back as corrupt.
+        format::check_lengths(key, format::Entry::Value(value))?;
         let record = Record::Value(value.to_vec());
         let mut inner = self.write_guard();
         // Durably log the write before it is acknowledged, then buffer it.
@@ -451,6 +479,7 @@ impl Engine {
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
+        format::check_lengths(key, format::Entry::Tombstone)?;
         let record = Record::Tombstone;
         let mut inner = self.write_guard();
         inner.durability.log_one(key, &record)?;
@@ -470,6 +499,9 @@ impl Engine {
                 (key, record)
             })
             .collect();
+        for (key, record) in &ops {
+            format::check_lengths(key, record.as_entry())?;
+        }
 
         let mut inner = self.write_guard();
         // The whole batch is logged as one record, so it is recovered atomically.

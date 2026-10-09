@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Durable writes via wal-db. Background compaction. Bloom-filtered reads.
     </p>
     <blockquote>
-        <strong>Status: 1.0 &mdash; stable.</strong> The public API is frozen until 2.0, and the on-disk run format is frozen for the 1.x series (since <code>0.3.0</code>; see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Crash-safe writes (<code>durability</code>) and bloom-filtered reads (<code>bloom</code>) ship as opt-in features. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: 1.1 &mdash; stable.</strong> The public API is frozen until 2.0, and the on-disk run format is frozen for the 1.x series (since <code>0.3.0</code>; see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Crash-safe writes (<code>durability</code>) and bloom-filtered reads (<code>bloom</code>) ship as opt-in features, and the run format builds without <code>std</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -53,6 +53,7 @@
 - **Bloom-filtered reads** &mdash; under the `bloom` feature, a per-run filter lets a point read skip any run that can't contain the key (negative lookups read no data blocks)
 - **Block cache** &mdash; a shared cache of decoded run blocks; a repeat point read over a hot working set does no I/O, checksum, or parse
 - **Shared, thread-safe handle** &mdash; one engine, many threads, behind an `Arc`
+- **`no_std` run codec** &mdash; `format::RunWriter` / `format::RunReader` write and read the same run bytes in memory, on bare-metal targets too (see [`no_std`](#no_std))
 
 
 <br>
@@ -61,11 +62,21 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.0"
+lsm-db = "1.1"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "1.0", features = ["durability", "bloom"] }
+lsm-db = { version = "1.1", features = ["durability", "bloom"] }
 ```
+
+### `no_std`
+
+The engine needs a filesystem, so it stays behind the default `std` feature. With `default-features = false` the crate builds on bare-metal targets and provides the run format as an in-memory codec: `format::RunWriter` and `format::RunReader` with the `alloc` feature, and `format::crc32c` and the error type without it. A run built on a device reads on a host and the other way round.
+
+```toml
+lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+```
+
+CRC32C is computed identically in every build. Without `std` it uses the SSE4.2 or ARMv8 CRC instructions when the target enables them at compile time (`-C target-feature=+sse4.2` / `+crc`) and a slicing-by-8 table otherwise. See [`docs/API.md`](./docs/API.md#no_std).
 
 <br>
 
@@ -107,7 +118,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is <code>v1.0.0</code> — the first **stable** release. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is <code>v1.1.0</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 adds real <code>no_std</code> support through the <code>format</code> run codec. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>

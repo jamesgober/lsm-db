@@ -18,6 +18,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.0] - 2026-10-09
+
+Real `no_std` support ([#2](https://github.com/jamesgober/lsm-db/issues/2)).
+The crate declared `no_std` when `std` was off, but `crc32c` and `error-forge`
+were unconditional dependencies and both need the standard library, so a
+`default-features = false` build failed on bare-metal targets. That build now
+compiles, and it carries the on-disk format as an in-memory codec. Nothing
+changes for `std` users: the engine, its API, the on-disk format, and the
+checksums it writes are the same.
+
+### Added
+
+- `format` module, available without `std`: `RunWriter` builds a sorted run in
+  memory and `RunReader` validates one and serves point lookups and in-order
+  iteration, borrowing keys and values from the buffer. `RunWriter` output is
+  byte-for-byte what the engine writes for the same entries, so runs move
+  between a host and a device in either direction. Also `format::crc32c`, the
+  `format::Entry` type, and the `MAX_KEY_LEN` / `MAX_VALUE_LEN` limits (1 GiB,
+  as the format already specified).
+- `alloc` feature: heap allocation without `std`, enabling `RunWriter` and
+  `RunReader`. `std` implies it.
+- `Error::InvalidInput`, returned for a key or value over the format limit and
+  for out-of-order keys given to `RunWriter`. `ForgeError::kind()` is
+  `"InvalidInput"` and it is not fatal.
+- A `no_std` CRC32C implementation in `src/crc.rs`. It uses the SSE4.2 or ARMv8
+  CRC instructions when the target enables them at compile time
+  (`-C target-feature=+sse4.2` / `+crc`), with the same three-stream scheme as
+  the `crc32c` crate, and slicing-by-8 tables otherwise. Tests check every path
+  against the `crc32c` crate and published check values (the CRC catalogue
+  `123456789` value and the RFC 3720 vectors) across every length and
+  alignment boundary.
+- CI: a `no_std` job that builds for `thumbv7em-none-eabihf`,
+  `riscv32imac-unknown-none-elf`, and `aarch64-unknown-none` (with `+crc`) on
+  stable and 1.85, and runs the library tests without `std` on the table and
+  hardware CRC paths.
+- `benches/crc.rs` and `examples/run_codec.rs`.
+
+### Changed
+
+- `crc32c` and `error-forge` are now optional, pulled in by `std` (on by
+  default). The `ForgeError` impl and `Error::Io` are only present with `std`.
+  Builds that keep `std` see no difference.
+- `durability` and `bloom` now imply `std`. Both need a filesystem and had no
+  effect without it.
+- The `std` build still forbids `unsafe` code. The one exception is a `no_std`
+  build whose target enables the CRC instructions: it calls those intrinsics,
+  four one-line `unsafe` blocks in `src/crc.rs`, each sound because the
+  instruction is guaranteed by the compile-time target feature.
+
+### Fixed
+
+- `Lsm::put`, `Lsm::delete`, and `Lsm::write` accepted keys and values longer
+  than 1 GiB. The format caps every length at 2^30, so the write succeeded and
+  the run it was flushed into then failed to read back as corrupt, which could
+  also stall compaction. They now return `Error::InvalidInput` before anything
+  is logged or buffered; a batch with one oversized entry is rejected whole.
+- Opening a run now rejects an index entry whose block lies outside the data
+  region as `Error::Corruption`, as `docs/SSTABLE_FORMAT.md` requires. Before,
+  such a block surfaced later as an I/O error when it was read.
+- `docs/SSTABLE_FORMAT.md` defined the checksum as "as produced by the `crc32c`
+  crate". It now gives the parameters and check value, so the format can be
+  implemented without that crate.
+
+---
+
 ## [1.0.0] - 2026-06-08
 
 First stable release. The **public API is frozen until 2.0** and the on-disk
@@ -369,7 +434,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/lsm-db/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/lsm-db/compare/v0.8.0...v0.9.0

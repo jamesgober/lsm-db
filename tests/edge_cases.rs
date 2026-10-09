@@ -80,3 +80,42 @@ fn io_failure_on_flush_is_an_error_not_a_panic() {
         "flush into a missing directory must error"
     );
 }
+
+/// Keys and values longer than the run format allows (1 GiB) are rejected up
+/// front. Before 1.1 they were accepted and the flushed run then failed to
+/// read back. The oversized buffers are zero-filled, so the OS backs them
+/// lazily and the test stays cheap.
+#[test]
+fn oversized_key_or_value_is_rejected_before_anything_is_written() {
+    use lsm_db::{Batch, Error, format};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Lsm::open(dir.path()).unwrap();
+    let too_long = vec![0u8; format::MAX_KEY_LEN + 1];
+
+    assert!(matches!(
+        db.put(&too_long, b"v"),
+        Err(Error::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        db.put(b"k", &too_long),
+        Err(Error::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        db.delete(&too_long),
+        Err(Error::InvalidInput { .. })
+    ));
+
+    // One bad entry rejects the whole batch.
+    let mut batch = Batch::new();
+    batch.put(b"good", b"1");
+    batch.put(b"bad", &too_long);
+    assert!(matches!(db.write(batch), Err(Error::InvalidInput { .. })));
+    drop(too_long);
+
+    assert_eq!(db.get(b"good").unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), None);
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+}
