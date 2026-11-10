@@ -4,9 +4,11 @@
 //! checksum is part of the frozen format: every build of this crate must
 //! produce bit-identical values.
 //!
-//! - **With `std`** (the default) this is the [`crc32c`](::crc32c) crate. It
-//!   picks the SSE4.2 `crc32` instruction on x86_64 or the ARMv8 CRC extension
-//!   on aarch64 at run time, with a table fallback.
+//! - **With `std`** (the default) the CPU is asked at run time: with SSE4.2 on
+//!   x86_64 or the ARMv8 CRC extension on aarch64 the [`hw`] path uses the
+//!   instruction, otherwise the [`sw`] path computes it with slicing-by-8
+//!   tables. (Until 1.2 this was the `crc32c` crate, which made the same
+//!   choice; the values are identical.)
 //! - **Without `std`** there is no run-time CPU detection, so the choice is made
 //!   at compile time. When the target enables the CRC instructions
 //!   (`target_feature = "sse4.2"` on x86_64, `target_feature = "crc"` on
@@ -19,9 +21,24 @@
 
 /// Computes the CRC32C of `data` (initial value `!0`, final XOR `!0`).
 #[cfg(feature = "std")]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    allow(unsafe_code)
+)]
 #[inline]
 pub(crate) fn crc32c(data: &[u8]) -> u32 {
-    ::crc32c::crc32c(data)
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: the CPU has SSE4.2, the requirement of `crc32c_detected`.
+        return unsafe { hw::crc32c_detected(data) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the CPU has the CRC extension, the requirement of
+        // `crc32c_detected`.
+        return unsafe { hw::crc32c_detected(data) };
+    }
+    sw::crc32c(data)
 }
 
 /// Computes the CRC32C of `data` (initial value `!0`, final XOR `!0`).
@@ -51,21 +68,18 @@ pub(crate) fn crc32c(data: &[u8]) -> u32 {
 }
 
 /// CRC32C polynomial `0x1EDC6F41` in reversed (LSB-first) bit order.
-#[cfg(any(test, not(feature = "std"),))]
 const POLY: u32 = 0x82F6_3B78;
 
-/// Portable slicing-by-8 implementation. Compiled for `no_std` builds without
-/// the CRC instructions, and always in tests so every other path can be checked
-/// against it.
+/// Portable slicing-by-8 implementation: `std` builds on a CPU without the CRC
+/// instructions, and `no_std` builds whose target lacks them. Always compiled
+/// in tests so every other path can be checked against it.
 #[cfg(any(
     test,
-    all(
-        not(feature = "std"),
-        not(any(
-            all(target_arch = "x86_64", target_feature = "sse4.2"),
-            all(target_arch = "aarch64", target_feature = "crc")
-        ))
-    )
+    feature = "std",
+    not(any(
+        all(target_arch = "x86_64", target_feature = "sse4.2"),
+        all(target_arch = "aarch64", target_feature = "crc")
+    ))
 ))]
 pub(crate) mod sw {
     use super::POLY;
@@ -128,21 +142,27 @@ pub(crate) mod sw {
     }
 }
 
-/// Hardware implementation for `no_std` builds whose target enables the CRC
-/// instructions at compile time.
+/// Hardware implementation: `no_std` builds whose target enables the CRC
+/// instructions at compile time, and `std` builds on x86_64 and aarch64, which
+/// use it once the CPU says it has them.
 ///
-/// This is the only `unsafe` in the crate, and it is compiled only in this
-/// configuration (the default `std` build stays `forbid(unsafe_code)`). Each
-/// `unsafe` block calls one CRC intrinsic. The intrinsics' sole safety
-/// requirement is that the CPU supports the instruction, which the
-/// `target_feature` the module is compiled under guarantees: the same
-/// guarantee every other function in a binary built for that target relies on.
-#[cfg(all(
-    not(feature = "std"),
-    any(
-        all(target_arch = "x86_64", target_feature = "sse4.2"),
-        all(target_arch = "aarch64", target_feature = "crc")
-    )
+/// This is the only `unsafe` in the crate. Each `unsafe` block calls one CRC
+/// intrinsic or the one function compiled with the CRC feature enabled. Their
+/// sole safety requirement is that the CPU supports the instruction: in a
+/// `no_std` build the `target_feature` the module is compiled under guarantees
+/// it (the same guarantee every other function in a binary built for that
+/// target relies on); in a `std` build [`crc32c_detected`] is reached only
+/// through [`super::crc32c`], after `is_x86_feature_detected!("sse4.2")` or
+/// `is_aarch64_feature_detected!("crc")` returned true.
+#[cfg(any(
+    all(
+        not(feature = "std"),
+        any(
+            all(target_arch = "x86_64", target_feature = "sse4.2"),
+            all(target_arch = "aarch64", target_feature = "crc")
+        )
+    ),
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 #[allow(unsafe_code)]
 pub(crate) mod hw {
@@ -162,8 +182,8 @@ pub(crate) mod hw {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn step_u64(crc: u32, word: u64) -> u32 {
-        // SAFETY: compiled only with `target_feature = "sse4.2"` enabled, the
-        // single requirement of `_mm_crc32_u64`.
+        // SAFETY: the CPU has SSE4.2, the single requirement of
+        // `_mm_crc32_u64`: see the module notes.
         let r = unsafe { core::arch::x86_64::_mm_crc32_u64(u64::from(crc), word) };
         r as u32
     }
@@ -172,8 +192,8 @@ pub(crate) mod hw {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn step_u8(crc: u32, byte: u8) -> u32 {
-        // SAFETY: compiled only with `target_feature = "sse4.2"` enabled, the
-        // single requirement of `_mm_crc32_u8`.
+        // SAFETY: the CPU has SSE4.2, the single requirement of
+        // `_mm_crc32_u8`: see the module notes.
         unsafe { core::arch::x86_64::_mm_crc32_u8(crc, byte) }
     }
 
@@ -181,8 +201,8 @@ pub(crate) mod hw {
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     fn step_u64(crc: u32, word: u64) -> u32 {
-        // SAFETY: compiled only with `target_feature = "crc"` enabled, the
-        // single requirement of `__crc32cd`.
+        // SAFETY: the CPU has the CRC extension, the single requirement of
+        // `__crc32cd`: see the module notes.
         unsafe { core::arch::aarch64::__crc32cd(crc, word) }
     }
 
@@ -190,8 +210,8 @@ pub(crate) mod hw {
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     fn step_u8(crc: u32, byte: u8) -> u32 {
-        // SAFETY: compiled only with `target_feature = "crc"` enabled, the
-        // single requirement of `__crc32cb`.
+        // SAFETY: the CPU has the CRC extension, the single requirement of
+        // `__crc32cb`: see the module notes.
         unsafe { core::arch::aarch64::__crc32cb(crc, byte) }
     }
 
@@ -202,8 +222,39 @@ pub(crate) mod hw {
         u64::from_le_bytes(word)
     }
 
-    /// CRC32C of `data`.
+    /// CRC32C of `data`, in a build whose target has the CRC instructions.
+    #[cfg(not(feature = "std"))]
     pub(crate) fn crc32c(data: &[u8]) -> u32 {
+        body(data)
+    }
+
+    /// CRC32C of `data`, compiled with SSE4.2 on.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE4.2 (`is_x86_feature_detected!("sse4.2")`).
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    pub(crate) unsafe fn crc32c_detected(data: &[u8]) -> u32 {
+        body(data)
+    }
+
+    /// CRC32C of `data`, compiled with the CRC extension on.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support the CRC extension
+    /// (`is_aarch64_feature_detected!("crc")`).
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[target_feature(enable = "crc")]
+    pub(crate) unsafe fn crc32c_detected(data: &[u8]) -> u32 {
+        body(data)
+    }
+
+    /// The three-way loop over `data`, inlined into each entry point so it
+    /// is compiled with the CRC feature on.
+    #[inline(always)]
+    fn body(data: &[u8]) -> u32 {
         let mut crc = !0u32;
         let mut rest = data;
         while rest.len() >= 3 * LONG {
@@ -409,15 +460,32 @@ mod tests {
         }
     }
 
-    #[cfg(all(
-        not(feature = "std"),
-        any(
-            all(target_arch = "x86_64", target_feature = "sse4.2"),
-            all(target_arch = "aarch64", target_feature = "crc")
-        )
+    #[cfg(any(
+        all(
+            not(feature = "std"),
+            any(
+                all(target_arch = "x86_64", target_feature = "sse4.2"),
+                all(target_arch = "aarch64", target_feature = "crc")
+            )
+        ),
+        all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))
     ))]
     #[test]
+    #[allow(unsafe_code)]
     fn test_hardware_matches_software() {
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if !std::is_x86_feature_detected!("sse4.2") {
+            return;
+        }
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        if !std::arch::is_aarch64_feature_detected!("crc") {
+            return;
+        }
+        // SAFETY: the CPU feature was checked just above.
+        #[cfg(feature = "std")]
+        let hw = |data: &[u8]| unsafe { hw::crc32c_detected(data) };
+        #[cfg(not(feature = "std"))]
+        let hw = hw::crc32c;
         let buf = noise(3 * 8192 * 2 + 3 * 256 + 64, 7);
         for len in lengths() {
             for offset in 0..8 {
@@ -425,11 +493,7 @@ mod tests {
                     continue;
                 }
                 let data = &buf[offset..offset + len];
-                assert_eq!(
-                    hw::crc32c(data),
-                    sw::crc32c(data),
-                    "len {len} offset {offset}"
-                );
+                assert_eq!(hw(data), sw::crc32c(data), "len {len} offset {offset}");
             }
         }
     }
