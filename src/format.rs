@@ -85,8 +85,8 @@ pub const MAX_VALUE_LEN: usize = 1 << 30;
 /// Computes the CRC32C (Castagnoli) checksum the format uses for data blocks,
 /// the index block, and bloom sidecars.
 ///
-/// With `std` this runs on the `crc32c` crate, which selects the SSE4.2 or
-/// ARMv8 CRC instructions at run time. Without `std` it uses those instructions
+/// With `std` this uses the SSE4.2 or ARMv8 CRC instructions when the CPU has
+/// them (asked at run time) and tables otherwise. Without `std` it uses those instructions
 /// when the target enables them at compile time (`-C target-feature=+sse4.2` on
 /// x86_64, `+crc` on aarch64) and a table-driven implementation otherwise. All
 /// paths produce identical values.

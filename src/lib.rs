@@ -94,36 +94,43 @@
 //! ```
 //!
 //! CRC32C is part of the format, so every build computes identical checksums.
-//! With `std` they come from the `crc32c` crate, which detects SSE4.2 or the
-//! ARMv8 CRC extension at run time. Without `std` there is no run-time
-//! detection: the hardware instructions are used when the target enables them
-//! at compile time (`-C target-feature=+sse4.2` on x86_64, `+crc` on aarch64)
-//! and a slicing-by-8 table otherwise.
+//! With `std` the crate asks the CPU at run time and uses SSE4.2 or the ARMv8
+//! CRC extension when present, slicing-by-8 tables otherwise. Without `std`
+//! there is no run-time detection: the hardware instructions are used when the
+//! target enables them at compile time (`-C target-feature=+sse4.2` on x86_64,
+//! `+crc` on aarch64) and the tables otherwise.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(warnings)]
 #![deny(missing_docs)]
-// No `unsafe` anywhere, except the CRC32C intrinsics a `no_std` build uses when
-// its target enables them at compile time (see `src/crc.rs`). Every other build,
-// including the default `std` one, forbids it outright.
+// No `unsafe` anywhere, except the CRC32C instructions in `src/crc.rs`, module
+// `hw`: compiled in `std` builds on x86_64 and aarch64 (used after run-time
+// detection) and in `no_std` builds whose target enables them. Every other
+// build forbids it outright.
 #![cfg_attr(
-    not(all(
-        not(feature = "std"),
-        any(
-            all(target_arch = "x86_64", target_feature = "sse4.2"),
-            all(target_arch = "aarch64", target_feature = "crc")
-        )
+    not(any(
+        all(
+            not(feature = "std"),
+            any(
+                all(target_arch = "x86_64", target_feature = "sse4.2"),
+                all(target_arch = "aarch64", target_feature = "crc")
+            )
+        ),
+        all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))
     )),
     forbid(unsafe_code)
 )]
 #![cfg_attr(
-    all(
-        not(feature = "std"),
-        any(
-            all(target_arch = "x86_64", target_feature = "sse4.2"),
-            all(target_arch = "aarch64", target_feature = "crc")
-        )
+    any(
+        all(
+            not(feature = "std"),
+            any(
+                all(target_arch = "x86_64", target_feature = "sse4.2"),
+                all(target_arch = "aarch64", target_feature = "crc")
+            )
+        ),
+        all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))
     ),
     deny(unsafe_code)
 )]

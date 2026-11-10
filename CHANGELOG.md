@@ -18,6 +18,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.0] - 2026-11-10
+
+No third-party crate in a default build. The on-disk format and every
+checksum are unchanged.
+
+### Changed
+
+- CRC32C is computed in the crate (`src/crc.rs`) instead of by the `crc32c`
+  crate, which is gone from `[dependencies]`. A `std` build asks the CPU at run
+  time and uses the SSE4.2 `crc32` instruction on x86_64 or the ARMv8 CRC
+  extension on aarch64, three streams at a time, and slicing-by-8 tables on
+  other CPUs. These are the same hardware loop and tables a `no_std` build has
+  used since 1.1. The values are byte-identical: the tests check every path
+  against the published vectors and against the `crc32c` crate (now a
+  dev-dependency only) on every length and alignment.
+- `unsafe` code: a `std` build on x86_64 or aarch64 now compiles the hardware
+  module (`deny(unsafe_code)` with that module allowed, each block commented);
+  every other build still forbids it.
+- `error-forge` 1.1 and `wal-db` 1.2, neither of which brings in a third-party
+  crate. A default build's `cargo tree -e normal` is `lsm-db`, `error-forge`,
+  and `error-forge-derive`.
+
+Measured on the release machine (Windows, x86_64), alternating 1.1 and 1.2 in
+one job: CRC32C of 4 KiB 150 ns against 163 ns, of 64 bytes 4.4 ns against
+11 ns; flush of 20,000 values 26.2 and 23.7 ms against 37.9 and 23.7 ms; point
+reads, scans, and opens unchanged within noise. A new benchmark,
+`checksum_paths`, measures the paths that checksum every block (flush, open,
+reads across runs).
+
+---
+
 ## [1.1.0] - 2026-10-09
 
 Real `no_std` support ([#2](https://github.com/jamesgober/lsm-db/issues/2)).
@@ -434,7 +465,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/lsm-db/compare/v0.9.0...v0.9.5

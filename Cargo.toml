@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "1.1.0"
+version = "1.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -70,8 +70,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [features]
 default = ["std"]
 # Standard library: the storage engine, the `error-forge` integration, and
-# run-time CRC32C hardware detection via `crc32c`.
-std = ["alloc", "dep:crc32c", "dep:error-forge"]
+# run-time CRC32C hardware detection (`src/crc.rs`).
+std = ["alloc", "dep:error-forge"]
 # Heap allocation without `std`: the in-memory run codec (`format::RunWriter`,
 # `format::RunReader`). Without it a `no_std` build still has `format::crc32c`
 # and the error type.
@@ -91,19 +91,12 @@ bloom = ["std", "dep:bloom-lib", "dep:postcard"]
 # error metadata (kind/caption/is_fatal) instead of thiserror/anyhow. Default
 # features are off — only the `ForgeError` trait is needed. It requires `std`,
 # so it is pulled in by the `std` feature.
-error-forge = { version = "1.0", optional = true, default-features = false }
+error-forge = { version = "1.1", optional = true, default-features = false }
 
-# Hardware-accelerated CRC32C (Castagnoli) for sorted-run integrity: per-block
-# and index checksums in the on-disk format. Picks the SSE4.2 `crc32`
-# instruction on x86_64 or the CRC extension on aarch64 at run time, with a
-# software fallback. Same choice as `wal-db`. Run-time CPU detection needs
-# `std`, so `no_std` builds use the compile-time implementation in `src/crc.rs`
-# instead; both produce identical checksums.
-crc32c = { version = "0.6", optional = true }
 
 # First-party primitives, each behind its own additive feature flag: durability
 # (0.4) and bloom (0.5). Optional so the default build pulls neither.
-wal-db    = { version = "1.0", optional = true, default-features = false }
+wal-db    = { version = "1.2", optional = true, default-features = false }
 # `serde` so a built filter can be persisted to / loaded from its sidecar; the
 # default hasher is fixed-seed, so a reloaded filter answers identically.
 bloom-lib = { version = "1.0", optional = true, default-features = false, features = ["std", "serde"] }
@@ -157,6 +150,10 @@ harness = false
 
 [[bench]]
 name    = "crc"
+harness = false
+
+[[bench]]
+name    = "checksum_paths"
 harness = false
 
 
