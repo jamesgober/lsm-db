@@ -101,8 +101,8 @@ struct Engine {
 ///
 /// Flushed runs are `fsync`ed and recorded in a manifest, so flushed data
 /// survives reopening and a crash mid-flush or mid-compaction recovers to a
-/// consistent run set. Dropping the handle flushes the in-memory buffer, so a
-/// clean exit keeps every write. A crash (the
+/// consistent run set. Dropping the handle, or [`close`](Lsm::close), flushes
+/// the in-memory buffer, so a clean exit keeps every write. A crash (the
 /// process killed, the machine losing power) before a flush loses the writes
 /// still buffered, unless the `durability` feature is on: it logs each write
 /// before acknowledging it and replays the log on open. Call
@@ -417,6 +417,64 @@ impl Lsm {
         self.engine.flush()
     }
 
+    /// Every key that starts with `prefix`, with its value, in ascending key
+    /// order: the scan of `prefix..` up to the first key that does not start
+    /// with it. A prefix of only `0xFF` bytes (or an empty one) has no upper
+    /// key, so its scan runs to the end of the key space.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// db.put(b"user:1", b"ann")?;
+    /// db.put(b"user:2", b"bo")?;
+    /// db.put(b"users", b"not a user key")?;
+    /// let users: Vec<_> = db.scan_prefix(b"user:")?.map(|(k, _)| k).collect();
+    /// assert_eq!(users, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`scan`](Self::scan).
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Scan> {
+        self.engine
+            .scan((Bound::Included(prefix.to_vec()), prefix_end(prefix)))
+    }
+
+    /// Close the database: stop the background compactor and flush the
+    /// in-memory buffer, returning any error the flush hits.
+    ///
+    /// Dropping the handle does the same, but has nowhere to report an
+    /// error, so call `close` when the caller can act on one (a full disk,
+    /// a failed sync). After `close` returns `Ok`, every write is in a run
+    /// on disk and is read back on reopen.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// db.put(b"k", b"v")?;
+    /// db.close()?;
+    ///
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`flush`](Self::flush).
+    pub fn close(mut self) -> Result<()> {
+        self.shut_down()
+    }
+
     /// Stop the compactor, then flush the buffer. Safe to call twice: the
     /// second call finds no compactor and an empty buffer.
     fn shut_down(&mut self) -> Result<()> {
@@ -469,8 +527,7 @@ impl Lsm {
 
 /// Dropping the handle stops the compactor and flushes the buffer, so a
 /// write is not lost because nobody called [`Lsm::flush`]. An error from
-/// that flush cannot be reported here; call [`Lsm::flush`] before the drop to
-/// see it.
+/// that flush cannot be reported here; [`Lsm::close`] returns it.
 impl Drop for Lsm {
     fn drop(&mut self) {
         let _ = self.shut_down();
@@ -553,18 +610,21 @@ impl Engine {
     where
         R: RangeBounds<Vec<u8>>,
     {
+        let start = range.start_bound().map(Vec::as_slice);
+        let end = range.end_bound().map(Vec::as_slice);
         let (mem, runs) = {
             let inner = self.read_guard();
             let mem: Vec<(Vec<u8>, Record)> = inner
                 .memtable
-                .iter()
-                .filter(|(k, _)| matches!(position(&range, k), Pos::In))
+                .range(start, end)
                 .map(|(k, r)| (k.clone(), r.clone()))
                 .collect();
             (mem, inner.runs.clone())
         };
 
-        let cursors = runs.iter().map(|r| r.cursor()).collect();
+        // Each run starts at the block that can hold the range's start, so
+        // a scan costs its range, not every key before it.
+        let cursors = runs.iter().map(|r| r.cursor_from(start)).collect();
         let mut out = Vec::new();
         for item in Merge::new(mem, cursors) {
             let (key, value) = item?;
@@ -779,6 +839,21 @@ enum Pos {
     Below,
     In,
     Above,
+}
+
+/// The exclusive end of the keys that start with `prefix`: the prefix with
+/// its last byte below `0xFF` raised by one and the bytes after it dropped.
+/// A prefix of only `0xFF` bytes, or an empty one, has no such key: every key
+/// after it starts with it, so the end is unbounded.
+fn prefix_end(prefix: &[u8]) -> Bound<Vec<u8>> {
+    match prefix.iter().rposition(|&b| b < u8::MAX) {
+        Some(last) => {
+            let mut end = prefix[..=last].to_vec();
+            end[last] += 1;
+            Bound::Excluded(end)
+        }
+        None => Bound::Unbounded,
+    }
 }
 
 /// Classify `key` against `range`.

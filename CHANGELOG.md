@@ -18,6 +18,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.3.0] - 2026-11-11
+
+Range scans cost their range, not their position in the key space; `close`
+and `scan_prefix`. The on-disk format and every checksum are unchanged.
+
+### Added
+
+- `Lsm::close(self)`: stops the compactor and flushes, returning the flush error that `Drop` cannot report.
+- `Lsm::scan_prefix(prefix)`: every key that starts with `prefix`. A prefix made only of `0xFF` bytes (or an empty one) scans to the end of the key space.
+- Benchmark `scan_range`: 100-key range scans over 100,000 keys in 8 runs, and over 50,000 keys in the memtable.
+
+### Changed
+
+- A range scan seeks to its start key: the memtable through `BTreeMap::range`, and each run from the first block whose last key reaches the start (found in the block index), instead of reading every key before the range. A scan now costs its range, not its position in the key space. Results are unchanged: a test compares 2,000 random ranges of every bound kind (including empty and inverted ones) with a model, over five runs and the memtable. Measured on Windows, x86_64, alternating with 1.2.1, three rounds: 100 keys at the end of 100,000 keys in 8 runs took 296 to 563 us, against 42 to 70 ms; at the end of a 50,000-key memtable, 18 to 44 us against 397 to 519 us; at the start of the key space, unchanged (154 to 468 us against 160 to 328 us).
+
+---
+
 ## [1.2.1] - 2026-11-11
 
 A drop no longer loses unflushed writes. The on-disk format and every
@@ -484,7 +501,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0

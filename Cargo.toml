@@ -160,6 +160,10 @@ harness = false
 name    = "checksum_paths"
 harness = false
 
+[[bench]]
+name    = "scan_range"
+harness = false
+
 
 # RELEASE PROFILE
 # #################################

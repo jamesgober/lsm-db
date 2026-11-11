@@ -49,7 +49,9 @@
     - [`Lsm::delete`](#lsmdelete)
     - [`Lsm::write`](#lsmwrite)
     - [`Lsm::scan`](#lsmscan)
+    - [`Lsm::scan_prefix`](#lsmscan_prefix)
     - [`Lsm::flush`](#lsmflush)
+    - [`Lsm::close`](#lsmclose)
   - [`LsmConfig`](#lsmconfig)
   - [`DEFAULT_MEMTABLE_CAPACITY`](#default_memtable_capacity)
   - [`DEFAULT_COMPACTION_TRIGGER`](#default_compaction_trigger)
@@ -425,6 +427,53 @@ let dir = tempfile::tempdir()?;
 // A fresh process opens the same directory and sees the flushed data.
 let db = lsm_db::Lsm::open(dir.path())?;
 assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+# Ok(())
+# }
+```
+
+#### `Lsm::close`
+
+```rust
+pub fn close(self) -> Result<()>
+```
+
+Since 1.3. Stop the background compactor and flush the buffer, returning the
+flush error. Dropping the handle does the same but cannot report an error, so
+call `close` where the caller can act on one (a full disk, a failed sync).
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+db.put(b"k", b"v")?;
+db.close()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+# Ok(())
+# }
+```
+
+#### `Lsm::scan_prefix`
+
+```rust
+pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Scan>
+```
+
+Since 1.3. Every key that starts with `prefix`, with its value, in ascending
+key order, as one snapshot like [`scan`](#lsmscan). A prefix made only of
+`0xFF` bytes, or an empty one, has no key after all its keys, so its scan runs
+to the end of the key space. Like every scan since 1.3, it seeks to its start,
+so its cost follows the keys it returns.
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+db.put(b"user:1", b"ann")?;
+db.put(b"user:2", b"bo")?;
+db.put(b"users", b"not a user key")?;
+let users: Vec<_> = db.scan_prefix(b"user:")?.map(|(k, _)| k).collect();
+assert_eq!(users, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
 # Ok(())
 # }
 ```
