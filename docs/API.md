@@ -17,7 +17,7 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: `1.2.1`, stable. API frozen until 2.0.** The surface below is frozen
+> **Status: `1.3.0`, stable. API frozen until 2.0.** The surface below is frozen
 > — no breaking change — over a multi-run engine with background compaction, a
 > block cache, optional crash-safe writes (`durability`), and optional
 > bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x
@@ -77,7 +77,7 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.1"
+lsm-db = "1.3"
 ```
 
 The engine requires the standard library, which is on by default. See
@@ -929,7 +929,7 @@ that gap:
 
 ```toml
 [dependencies]
-lsm-db = { version = "1.1", features = ["durability"] }
+lsm-db = { version = "1.3", features = ["durability"] }
 ```
 
 With it on, every `put` / `delete` / `write` is appended to a `wal-db`
@@ -968,7 +968,7 @@ block:
 
 ```toml
 [dependencies]
-lsm-db = { version = "1.1", features = ["bloom"] }
+lsm-db = { version = "1.3", features = ["bloom"] }
 ```
 
 The win is on negative lookups across many runs: in a benchmark of misses over
@@ -1020,9 +1020,9 @@ the [`format`](#format) codec does not.
 ```toml
 [dependencies]
 # Run codec, needs a global allocator.
-lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
 # Or only crc32c, Entry, the limits, and Error, with no allocator at all.
-lsm-db = { version = "1.1", default-features = false }
+lsm-db = { version = "1.3", default-features = false }
 ```
 
 The checksum is part of the format, so it is identical in every build. Without

@@ -90,7 +90,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+//! lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
 //! ```
 //!
 //! CRC32C is part of the format, so every build computes identical checksums.
