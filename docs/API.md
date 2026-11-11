@@ -179,10 +179,11 @@ let dir = tempfile::tempdir()?;
 // Open by path.
 let db = Lsm::open(dir.path())?;
 db.put(b"k", b"v")?;
-drop(db);
+drop(db); // dropping flushes the buffer (since 1.2.1)
 
-// Reopen the same directory; flushed data is restored.
+// Reopen the same directory; the write is there.
 let db = Lsm::open(dir.path())?;
+assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
 db.flush()?; // nothing buffered, no-op
 # Ok(())
 # }
@@ -828,7 +829,10 @@ used from many threads. Reads proceed in parallel; writes are serialized;
 the duration of iteration. A background thread compacts runs as they accumulate;
 its expensive merge runs with no lock held, taking the engine lock only to swap
 the finished run in, so it does not block reads or writes for the merge. Dropping
-the `Lsm` stops and joins that thread.
+the `Lsm` stops and joins that thread, then flushes the buffer (since 1.2.1;
+before that a drop discarded unflushed writes in a build without
+`durability`). A flush error at drop cannot be reported; call
+[`flush`](#lsmflush) first to see it.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {

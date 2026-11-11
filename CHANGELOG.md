@@ -12,9 +12,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The bloom sidecar's dependencies are pinned: `bloom-lib` to `=1.0.0`, and `postcard` to 1.1 patch releases (`>=1.1.3, <1.2`). The sidecar bytes are frozen for 1.x, and bloom-lib does not yet promise a stable byte layout.
+
 ### Fixed
 
+- **Dropping an `Lsm` lost writes that had not been flushed** in a build without the `durability` feature, the default: `Drop` stopped the compactor and discarded the memtable. `Drop` now stops the compactor and then flushes, so a clean exit keeps every write. An error from that flush cannot be reported from `Drop`; call `flush` before dropping to see it. With `durability` on, the writes were already in the log, and the flush only saves the replay at the next open. `tests/drop.rs` reproduces the loss on 1.2.0.
+
 ### Security
+
+- A golden-file test (`tests/data/bloom-sidecar-v1.bin`, byte-identical to a sidecar written by lsm-db 1.2.0) checks that today's build decodes a 1.2.0 sidecar and encodes it, and a fresh filter over the same keys, to the same bytes. A dependency update that changes the layout fails the test instead of silently changing what runs on disk hold.
 
 ---
 

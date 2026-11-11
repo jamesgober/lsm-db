@@ -101,10 +101,12 @@ struct Engine {
 ///
 /// Flushed runs are `fsync`ed and recorded in a manifest, so flushed data
 /// survives reopening and a crash mid-flush or mid-compaction recovers to a
-/// consistent run set. Writes still buffered in the memtable when the process
-/// exits without a flush are **not** yet crash-safe; write-ahead logging arrives
-/// under the `durability` feature in a later release. Call [`flush`](Lsm::flush)
-/// to force the buffer to disk on demand.
+/// consistent run set. Dropping the handle flushes the in-memory buffer, so a
+/// clean exit keeps every write. A crash (the
+/// process killed, the machine losing power) before a flush loses the writes
+/// still buffered, unless the `durability` feature is on: it logs each write
+/// before acknowledging it and replays the log on open. Call
+/// [`flush`](Lsm::flush) to force the buffer to disk on demand.
 ///
 /// # Examples
 ///
@@ -415,6 +417,24 @@ impl Lsm {
         self.engine.flush()
     }
 
+    /// Stop the compactor, then flush the buffer. Safe to call twice: the
+    /// second call finds no compactor and an empty buffer.
+    fn shut_down(&mut self) -> Result<()> {
+        {
+            let mut state = self
+                .engine
+                .compaction
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            state.shutdown = true;
+        }
+        self.engine.cond.notify_all();
+        if let Some(handle) = self.compactor.take() {
+            let _ = handle.join();
+        }
+        self.engine.flush()
+    }
+
     /// Run one compaction synchronously. Test-only; production compaction is the
     /// background thread.
     #[cfg(test)]
@@ -447,20 +467,13 @@ impl Lsm {
     }
 }
 
+/// Dropping the handle stops the compactor and flushes the buffer, so a
+/// write is not lost because nobody called [`Lsm::flush`]. An error from
+/// that flush cannot be reported here; call [`Lsm::flush`] before the drop to
+/// see it.
 impl Drop for Lsm {
     fn drop(&mut self) {
-        {
-            let mut state = self
-                .engine
-                .compaction
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            state.shutdown = true;
-        }
-        self.engine.cond.notify_all();
-        if let Some(handle) = self.compactor.take() {
-            let _ = handle.join();
-        }
+        let _ = self.shut_down();
     }
 }
 

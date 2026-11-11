@@ -106,7 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} = {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
     }
 
-    // Force the buffer to disk; it will be there on the next open.
+    // Force the buffer to disk now. Dropping `db` does the same, so a clean
+    // exit keeps every write; `flush` is where a disk error is reported.
     db.flush()?;
     Ok(())
 }
