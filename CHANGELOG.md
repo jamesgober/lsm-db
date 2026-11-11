@@ -12,6 +12,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+### Fixed
+
+### Security
+
+---
+
+## [1.2.1] - 2026-11-11
+
+A drop no longer loses unflushed writes. The on-disk format and every
+checksum are unchanged.
+
+### Changed
+
 - The bloom sidecar's dependencies are pinned: `bloom-lib` to `=1.0.0`, and `postcard` to 1.1 patch releases (`>=1.1.3, <1.2`). The sidecar bytes are frozen for 1.x, and bloom-lib does not yet promise a stable byte layout.
 
 ### Fixed
@@ -471,7 +484,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...v1.0.0

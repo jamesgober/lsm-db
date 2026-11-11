@@ -17,7 +17,7 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: `1.2.0`, stable. API frozen until 2.0.** The surface below is frozen
+> **Status: `1.2.1`, stable. API frozen until 2.0.** The surface below is frozen
 > — no breaking change — over a multi-run engine with background compaction, a
 > block cache, optional crash-safe writes (`durability`), and optional
 > bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x

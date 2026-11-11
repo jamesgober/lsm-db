@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "1.2.0"
+version = "1.2.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
