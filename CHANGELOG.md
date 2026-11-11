@@ -18,6 +18,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.1] - 2026-11-11
+
+A drop no longer loses unflushed writes. The on-disk format and every
+checksum are unchanged.
+
+### Changed
+
+- The bloom sidecar's dependencies are pinned: `bloom-lib` to `=1.0.0`, and `postcard` to 1.1 patch releases (`>=1.1.3, <1.2`). The sidecar bytes are frozen for 1.x, and bloom-lib does not yet promise a stable byte layout.
+
+### Fixed
+
+- **Dropping an `Lsm` lost writes that had not been flushed** in a build without the `durability` feature, the default: `Drop` stopped the compactor and discarded the memtable. `Drop` now stops the compactor and then flushes, so a clean exit keeps every write. An error from that flush cannot be reported from `Drop`; call `flush` before dropping to see it. With `durability` on, the writes were already in the log, and the flush only saves the replay at the next open. `tests/drop.rs` reproduces the loss on 1.2.0.
+
+### Security
+
+- A golden-file test (`tests/data/bloom-sidecar-v1.bin`, byte-identical to a sidecar written by lsm-db 1.2.0) checks that today's build decodes a 1.2.0 sidecar and encodes it, and a fresh filter over the same keys, to the same bytes. A dependency update that changes the layout fails the test instead of silently changing what runs on disk hold.
+
+---
+
 ## [1.2.0] - 2026-11-10
 
 No third-party crate in a default build. The on-disk format and every
@@ -465,7 +484,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/lsm-db/compare/v0.9.5...v1.0.0

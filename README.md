@@ -106,7 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} = {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
     }
 
-    // Force the buffer to disk; it will be there on the next open.
+    // Force the buffer to disk now. Dropping `db` does the same, so a clean
+    // exit keeps every write; `flush` is where a disk error is reported.
     db.flush()?;
     Ok(())
 }
@@ -118,7 +119,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is <code>v1.2.0</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is <code>v1.2.1</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>

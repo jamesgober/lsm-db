@@ -196,12 +196,7 @@ mod enabled {
         /// (temporary file, then rename), wrapped in its integrity envelope.
         pub(crate) fn write_sidecar(&self, run_path: &Path) -> Result<()> {
             let path = sidecar_path(run_path);
-            let payload = postcard::to_allocvec(&self.filter)
-                .map_err(|_| Error::corruption("failed to encode bloom sidecar"))?;
-            let mut bytes = Vec::with_capacity(12 + payload.len());
-            bytes.extend_from_slice(SIDECAR_MAGIC);
-            bytes.extend_from_slice(&crate::crc::crc32c(&payload).to_le_bytes());
-            bytes.extend_from_slice(&payload);
+            let bytes = self.encode()?;
 
             let mut tmp = path.clone().into_os_string();
             tmp.push(".tmp");
@@ -209,6 +204,20 @@ mod enabled {
             fs::write(&tmp, &bytes).map_err(|e| Error::io("write bloom sidecar", e))?;
             fs::rename(&tmp, &path).map_err(|e| Error::io("install bloom sidecar", e))?;
             Ok(())
+        }
+
+        /// The sidecar's bytes: magic, CRC32C of the payload, and the payload
+        /// (the filter as postcard encodes it). The bytes are frozen for 1.x:
+        /// `tests/data/bloom-sidecar-v1.bin` holds a sidecar written by 1.2.0,
+        /// which every later build must decode and encode identically.
+        fn encode(&self) -> Result<Vec<u8>> {
+            let payload = postcard::to_allocvec(&self.filter)
+                .map_err(|_| Error::corruption("failed to encode bloom sidecar"))?;
+            let mut bytes = Vec::with_capacity(12 + payload.len());
+            bytes.extend_from_slice(SIDECAR_MAGIC);
+            bytes.extend_from_slice(&crate::crc::crc32c(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
         }
 
         /// Whether the run *might* contain `key`. `false` is definitive (the key
@@ -223,6 +232,54 @@ mod enabled {
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod tests {
         use super::*;
+
+        /// The keys of the golden sidecar.
+        fn golden_keys() -> Vec<Vec<u8>> {
+            (0..1000u32)
+                .map(|i| format!("key-{i:04}").into_bytes())
+                .collect()
+        }
+
+        fn golden_filter() -> RunFilter {
+            let keys = golden_keys();
+            let mut b = builder(keys.len());
+            for k in &keys {
+                b.add(k);
+            }
+            b.finish().unwrap()
+        }
+
+        const GOLDEN: &[u8] = include_bytes!("../tests/data/bloom-sidecar-v1.bin");
+
+        /// Rewrite the golden file from this build. Run only by hand, to
+        /// create it: `LSM_WRITE_GOLDEN=1 cargo test --features bloom golden`.
+        #[test]
+        fn test_write_golden_when_asked() {
+            if std::env::var_os("LSM_WRITE_GOLDEN").is_some() {
+                let bytes = golden_filter().encode().unwrap();
+                std::fs::write("tests/data/bloom-sidecar-v1.bin", bytes).unwrap();
+            }
+        }
+
+        /// A sidecar written by 1.2.0 decodes, holds every key it was built
+        /// from, and encodes to the same bytes; building the same keys today
+        /// writes the same bytes. A bloom-lib, postcard, or serde update that
+        /// changes the layout fails here instead of silently changing what
+        /// runs on disk hold.
+        #[test]
+        fn test_golden_sidecar_decodes_and_encodes_identically() {
+            let filter = RunFilter::decode(GOLDEN).expect("the golden sidecar decodes");
+            let filter = RunFilter { filter };
+            for key in golden_keys() {
+                assert!(filter.might_contain(&key));
+            }
+            assert_eq!(filter.encode().unwrap(), GOLDEN, "re-encoded bytes differ");
+            assert_eq!(
+                golden_filter().encode().unwrap(),
+                GOLDEN,
+                "a fresh build's bytes differ"
+            );
+        }
 
         fn build(keys: &[&[u8]]) -> RunFilter {
             let mut b = builder(keys.len());
