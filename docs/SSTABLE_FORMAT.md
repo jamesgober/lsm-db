@@ -35,6 +35,7 @@
   - [Data blocks](#data-blocks)
   - [Index block](#index-block)
   - [Footer](#footer)
+  - [Footer check](#footer-check)
   - [Reading a run](#reading-a-run)
   - [Integrity](#integrity)
 - [Manifest](#manifest)
@@ -69,6 +70,8 @@ A sorted run is one immutable file. Its structure, in file order:
 │ Data block 0                   │
 │ Data block 1                   │
 │ …                              │
+├────────────────────────────────┤  index_offset − 12
+│ Footer check  (12 bytes)       │  written since 1.4; see below
 ├────────────────────────────────┤  index_offset
 │ Index block                    │
 ├────────────────────────────────┤  index_offset + index_len
@@ -134,7 +137,7 @@ The footer is the final **36 bytes** of the file:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `entry_count` | `u64` | Total number of entries (values + tombstones). Informational. |
+| `entry_count` | `u64` | Total number of entries (values + tombstones). See below. |
 | `index_offset` | `u64` | Offset of the index block. |
 | `index_len` | `u64` | Length of the index block in bytes. |
 | `index_crc` | `u32` | CRC32C of the index block's bytes. |
@@ -143,30 +146,64 @@ The footer is the final **36 bytes** of the file:
 `index_offset + index_len` MUST equal `file_len − 36`. `index_offset` MUST be
 ≥ 8 (past the header).
 
+`entry_count` MUST be at least the number of data blocks (a block holds at
+least one entry) and at most the data blocks' total length divided by 9 (the
+smallest entry: a key length, a tag, and a value length, with no key or value
+bytes). A reader MUST treat any other count as corruption; since 1.4 the
+reference reader does. A count is never used to size an allocation before it
+is checked.
+
+### Footer check
+
+Since 1.4 the reference writers put a **footer check** in the 12 bytes between
+the end of the last data block and the index block:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `check_magic` | `[u8; 8]` | ASCII `"LSMFCK01"` (`4C 53 4D 46 43 4B 30 31`). |
+| `footer_crc` | `u32` | CRC32C of the 36 footer bytes. |
+
+A run has a footer check when `index_offset` is exactly 12 bytes past the end
+of its last data block (offset 8 when there are no blocks) and those 12 bytes
+begin with `check_magic`. A reader MUST then verify `footer_crc` and treat a
+mismatch as corruption. A run without one (any run written before 1.4) is read
+as before; its `entry_count` is still checked as above.
+
+The check is additive: no data block covers those 12 bytes, so a reader that
+predates it reads a run that has it, and the format version stays 1. Readers
+from 1.0 to 1.3 read runs written by 1.4, and 1.4 reads theirs.
+
 ### Reading a run
 
 A reader MUST:
 
-1. Verify the file is at least `8 + 36` bytes.
+1. Verify the file is at least `8 + 36` bytes and begins with the header magic.
 2. Read the 36-byte footer and verify the trailing `magic`.
 3. Read the index block at `[index_offset, index_offset + index_len)` and verify
    its CRC32C equals `index_crc`.
 4. Parse the index into block handles, rejecting non-increasing `last_key`s and
    any block whose extent `[block_offset, block_offset + block_len)` is not
    inside the data region `[8, index_offset)`.
+5. If the run has a footer check, verify it; in every run, check `entry_count`
+   against the blocks.
 
 To look up a key, binary-search the index for the first block whose `last_key`
 ≥ the key, read that block, verify its `block_crc`, and scan it. To iterate,
-read blocks in order. `entry_count` is not required for reading and a reader MAY
-ignore it.
+read blocks in order, checking that each block ends with the `last_key` the
+index records for it and that its first key is greater than the previous
+block's `last_key`. `entry_count` is not required for reading.
 
 ### Integrity
 
-Every data block is covered by a CRC32C in the index, and the index by a CRC32C
-in the footer. A reader MUST treat a checksum mismatch, an out-of-range offset or
-length, an unknown `tag`, a non-zero `value_len` on a tombstone, or
-non-increasing keys as **corruption** and MUST NOT return fabricated or partial
-data for the affected block.
+Every data block is covered by a CRC32C in the index, the index by a CRC32C in
+the footer, and (since 1.4) the footer by the CRC32C in its footer check. A
+reader MUST treat a checksum mismatch, an out-of-range offset or length, an
+unknown `tag`, a non-zero `value_len` on a tombstone, non-increasing keys, or an
+`entry_count` that does not fit the blocks as **corruption** and MUST NOT return
+fabricated or partial data for the affected block.
+
+These checksums detect damage. They are not authentication: anyone who can
+write a run can compute them.
 
 ---
 
@@ -187,7 +224,10 @@ next_seq=<u64>
 - Line 2 MUST be `next_seq=` followed by a base-10 `u64`: the next run sequence
   number to allocate.
 - Each remaining non-empty line is a run filename, listed **newest first**. This
-  order is the recency order reads and merges rely on.
+  order is the recency order reads and merges rely on. A name MUST be exactly
+  `run-<seq>.sst` as defined below, with no path separator; a reader MUST treat
+  any other line as corruption (the reference reader does since 1.4).
+- A name MUST NOT appear twice.
 
 Run files are named `run-<seq>.sst`, where `<seq>` is the zero-padded, 10-digit
 decimal sequence number (e.g. `run-0000000042.sst`). The manifest is the sole
@@ -206,18 +246,36 @@ A database is a directory containing:
 
 - `MANIFEST` — the live run list (above).
 - `run-<seq>.sst` — sorted runs.
+- `run-<seq>.sst.bloom`: a run's bloom filter (`bloom` feature); a hint only.
+- `wal.log`: the write-ahead log (`durability` feature).
+- `LOCK`: held by the open handle (since 1.4). Its content is the owner's
+  process id, for information.
+- `MANIFEST.old`: a manifest replaced by a rebuild (since 1.4).
 - `*.tmp` — transient files mid-write; never live.
 
-On open, an implementation MUST:
+Every store writes its `MANIFEST` when it is created (since 1.3). On open, an
+implementation MUST:
 
-1. Load `MANIFEST` (a missing manifest means an empty database).
-2. Open every run it names, in order. A named run that is missing or fails its
-   integrity checks is corruption.
-3. Delete every `*.tmp` file and every `run-<seq>.sst` **not** named by the
+1. Take the directory lock, and fail if another handle holds it.
+2. Load `MANIFEST`. Only a manifest that does not exist is missing; any other
+   failure to read it is an error. When it is missing, the directory is a new,
+   empty database only if it holds nothing but `LOCK`, `*.tmp` files, and
+   `wal.log` (a store from before 1.3 that never flushed may have only a log);
+   run files without a manifest are corruption, and any other content refuses
+   the open. In both cases nothing is deleted.
+3. Open every run the manifest names, in order. A named run that is missing or
+   fails its integrity checks is corruption.
+4. Delete every `*.tmp` file and every `run-<seq>.sst` **not** named by the
    manifest — these are orphans from a flush or compaction interrupted before its
-   commit. The committed state is exactly what the manifest names.
-4. Set the next sequence number to at least one past the highest `<seq>` seen on
+   commit. The committed state is exactly what the manifest names. This step
+   runs only after steps 2 and 3 succeeded.
+5. Set the next sequence number to at least one past the highest `<seq>` seen on
    disk.
+
+A lost or damaged manifest can be written again from the runs present
+(`Lsm::rebuild_manifest`): the runs are ordered newest first by `<seq>`, which
+is the recency order, because a flush or compaction takes its sequence number
+when it starts and a compaction merges every run that exists at that moment.
 
 Because both the run files and the manifest are installed by atomic rename, a
 crash at any point leaves either the previous committed state or the next one,

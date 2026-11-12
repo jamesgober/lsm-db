@@ -1,6 +1,6 @@
 //! Criterion benchmarks for the hot paths: point write, point read (hit and
-//! miss), and full scan. Run with `cargo bench`; baselines are tracked over time
-//! so a regression beyond the project threshold blocks a merge.
+//! miss), full scan, and flush. Run with `cargo bench`; baselines are tracked
+//! over time so a regression beyond the project threshold blocks a merge.
 
 use std::hint::black_box;
 
@@ -104,12 +104,43 @@ fn bench_negative_lookup_many_runs(c: &mut Criterion) {
     });
 }
 
+/// Flush a memtable of 10,000 entries (about 360 KiB of keys and values) to
+/// a new run in an empty store: the run write, its `fsync`, the directory
+/// sync, and the manifest install.
+fn bench_flush(c: &mut Criterion) {
+    c.bench_function("flush_10k_entries", |b| {
+        b.iter_batched(
+            || {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db = Lsm::open_with(
+                    dir.path(),
+                    LsmConfig::new()
+                        .memtable_capacity(1 << 30)
+                        .compaction_trigger(usize::MAX),
+                )
+                .expect("open");
+                for i in 0..10_000u32 {
+                    db.put(key(i), b"value-payload-of-modest-size")
+                        .expect("put");
+                }
+                (dir, db)
+            },
+            |(dir, db)| {
+                db.flush().expect("flush");
+                (dir, db)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_put,
     bench_get_hit,
     bench_get_miss,
     bench_scan,
-    bench_negative_lookup_many_runs
+    bench_negative_lookup_many_runs,
+    bench_flush
 );
 criterion_main!(benches);

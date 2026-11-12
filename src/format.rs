@@ -56,6 +56,22 @@ pub(crate) const MAGIC: &[u8; 8] = b"LSMTBL01";
 #[cfg(feature = "alloc")]
 pub(crate) const FOOTER_LEN: usize = 8 + 8 + 8 + 4 + 8;
 
+/// Size of the footer check: a magic and the CRC32C of the footer, written
+/// between the last data block and the index since 1.4. Readers before 1.4
+/// never read those bytes (no data block covers them), so they read runs
+/// that have it, and runs without it still open.
+#[cfg(feature = "alloc")]
+pub(crate) const FOOTER_CHECK_LEN: usize = 8 + 4;
+
+/// Magic of the footer check.
+#[cfg(feature = "alloc")]
+const FOOTER_CHECK_MAGIC: &[u8; 8] = b"LSMFCK01";
+
+/// The smallest entry: a key length, a tag, and a value length, with an
+/// empty key and no value.
+#[cfg(feature = "alloc")]
+const MIN_ENTRY_LEN: u64 = 4 + 1 + 4;
+
 /// Target size of a data block before it is closed. A single entry larger than
 /// this becomes a block of its own; entries are never split across blocks.
 #[cfg(feature = "alloc")]
@@ -215,6 +231,15 @@ pub(crate) fn encode_footer(
     footer
 }
 
+/// The footer check for `footer`: the magic and the footer's CRC32C.
+#[cfg(feature = "alloc")]
+pub(crate) fn encode_footer_check(footer: &[u8; FOOTER_LEN]) -> [u8; FOOTER_CHECK_LEN] {
+    let mut check = [0u8; FOOTER_CHECK_LEN];
+    check[0..8].copy_from_slice(FOOTER_CHECK_MAGIC);
+    check[8..12].copy_from_slice(&crc32c(footer).to_le_bytes());
+    check
+}
+
 // ---------------------------------------------------------------------------
 // Decoding, shared by `RunReader` and the engine's file reader.
 // ---------------------------------------------------------------------------
@@ -255,6 +280,48 @@ impl Footer {
             ));
         }
         Ok(parsed)
+    }
+
+    /// Check the footer against the index it describes, after the index has
+    /// passed its checksum and been parsed.
+    ///
+    /// - When the run has a footer check (the 12 bytes between the end of
+    ///   the last data block and the index hold its magic), the footer must
+    ///   match its CRC32C.
+    /// - `entry_count` must fit the data: at least one entry per block, and
+    ///   no more than the blocks' bytes can hold at the smallest entry size.
+    ///   A count is otherwise never trusted, so a damaged one cannot size an
+    ///   allocation.
+    ///
+    /// `blocks` yields each block's `(offset, len)`; `before_index` is the
+    /// bytes just before `index_offset`, up to [`FOOTER_CHECK_LEN`] of them.
+    pub(crate) fn verify(
+        &self,
+        footer: &[u8; FOOTER_LEN],
+        blocks: impl Iterator<Item = (u64, u32)>,
+        before_index: &[u8],
+    ) -> Result<()> {
+        let mut data_end = MAGIC.len() as u64;
+        let mut block_bytes = 0u64;
+        let mut block_count = 0u64;
+        for (offset, len) in blocks {
+            // `IndexEntries` checked each extent lies inside the data region.
+            data_end = data_end.max(offset + u64::from(len));
+            block_bytes += u64::from(len);
+            block_count += 1;
+        }
+        let has_check = self.index_offset.checked_sub(data_end) == Some(FOOTER_CHECK_LEN as u64)
+            && before_index.len() == FOOTER_CHECK_LEN
+            && &before_index[0..8] == FOOTER_CHECK_MAGIC;
+        if has_check && u32::from_le_bytes(arr(&before_index[8..12])) != crc32c(footer) {
+            return Err(Error::corruption("footer checksum mismatch"));
+        }
+        if self.entry_count < block_count || self.entry_count > block_bytes / MIN_ENTRY_LEN {
+            return Err(Error::corruption(
+                "footer entry count inconsistent with the run's blocks",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -579,20 +646,24 @@ impl RunWriter {
         self.block_start = self.out.len();
     }
 
-    /// Close the last block, append the index and footer, and return the run.
+    /// Close the last block, append the footer check, the index, and the
+    /// footer, and return the run.
     #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         self.close_block();
-        let index_offset = self.out.len() as u64;
+        let index_offset = (self.out.len() + FOOTER_CHECK_LEN) as u64;
         let index_crc = crc32c(&self.index);
-        self.out.reserve(self.index.len() + FOOTER_LEN);
-        self.out.extend_from_slice(&self.index);
-        self.out.extend_from_slice(&encode_footer(
+        let footer = encode_footer(
             self.entry_count,
             index_offset,
             self.index.len() as u64,
             index_crc,
-        ));
+        );
+        self.out
+            .reserve(FOOTER_CHECK_LEN + self.index.len() + FOOTER_LEN);
+        self.out.extend_from_slice(&encode_footer_check(&footer));
+        self.out.extend_from_slice(&self.index);
+        self.out.extend_from_slice(&footer);
         self.out
     }
 }
@@ -600,7 +671,8 @@ impl RunWriter {
 /// A validated sorted run held in memory.
 ///
 /// [`new`](RunReader::new) checks the header and footer magic, the index
-/// extent, the index checksum, and every index entry. Each data block's
+/// extent, the index checksum, every index entry, the footer checksum (in
+/// runs written since 1.4), and the entry count. Each data block's
 /// checksum is verified when the block is read, by [`get`](RunReader::get) or
 /// [`iter`](RunReader::iter). Keys and values are returned as slices of the
 /// original buffer; nothing is copied.
@@ -638,8 +710,9 @@ impl<'a> RunReader<'a> {
     ///
     /// [`Error::Corruption`] if the buffer is too short, either magic is wrong,
     /// the index extent does not match the buffer, the index checksum does not
-    /// match, or an index entry is malformed, out of order, or points outside
-    /// the data region.
+    /// match, an index entry is malformed, out of order, or points outside
+    /// the data region, the footer fails its checksum, or the entry count
+    /// does not fit the blocks.
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() < MAGIC.len() + FOOTER_LEN {
             return Err(Error::corruption("file shorter than header and footer"));
@@ -648,7 +721,8 @@ impl<'a> RunReader<'a> {
             return Err(Error::corruption("bad magic; not an lsm-db sorted run"));
         }
         let file_len = bytes.len() as u64;
-        let footer = Footer::parse(&arr(&bytes[bytes.len() - FOOTER_LEN..]), file_len)?;
+        let footer_bytes: [u8; FOOTER_LEN] = arr(&bytes[bytes.len() - FOOTER_LEN..]);
+        let footer = Footer::parse(&footer_bytes, file_len)?;
         // `Footer::parse` checked that the index lies inside the buffer, so
         // both bounds fit `usize`.
         let start = footer.index_offset as usize;
@@ -658,6 +732,12 @@ impl<'a> RunReader<'a> {
         }
         let index =
             IndexEntries::new(index_bytes, footer.index_offset).collect::<Result<Vec<_>>>()?;
+        let before_index = &bytes[start.saturating_sub(FOOTER_CHECK_LEN).max(MAGIC.len())..start];
+        footer.verify(
+            &footer_bytes,
+            index.iter().map(|h| (h.offset, h.len)),
+            before_index,
+        )?;
         Ok(RunReader {
             bytes,
             index,
@@ -667,8 +747,8 @@ impl<'a> RunReader<'a> {
 
     /// The entry count recorded in the footer (values and tombstones).
     ///
-    /// The format treats this as informational; [`iter`](RunReader::iter) is
-    /// the authority on what the run holds.
+    /// [`new`](RunReader::new) checked that it fits the run's blocks; still,
+    /// [`iter`](RunReader::iter) is the authority on what the run holds.
     #[inline]
     #[must_use]
     pub fn entry_count(&self) -> u64 {
@@ -834,10 +914,34 @@ mod tests {
         w.finish()
     }
 
+    /// `bytes` as a run written before 1.4: the footer check removed and the
+    /// footer's index offset moved back over it.
+    fn without_footer_check(bytes: &[u8]) -> Vec<u8> {
+        let footer =
+            Footer::parse(&arr(&bytes[bytes.len() - FOOTER_LEN..]), bytes.len() as u64).unwrap();
+        let at = footer.index_offset as usize;
+        assert_eq!(&bytes[at - FOOTER_CHECK_LEN..at - 4], FOOTER_CHECK_MAGIC);
+        let mut out = bytes[..at - FOOTER_CHECK_LEN].to_vec();
+        out.extend_from_slice(&bytes[at..bytes.len() - FOOTER_LEN]);
+        out.extend_from_slice(&encode_footer(
+            footer.entry_count,
+            footer.index_offset - FOOTER_CHECK_LEN as u64,
+            footer.index_len,
+            footer.index_crc,
+        ));
+        out
+    }
+
+    /// Overwrite the footer's entry count.
+    fn set_entry_count(bytes: &mut [u8], count: u64) {
+        let at = bytes.len() - FOOTER_LEN;
+        bytes[at..at + 8].copy_from_slice(&count.to_le_bytes());
+    }
+
     #[test]
     fn test_empty_run_roundtrip() {
         let bytes = RunWriter::new().finish();
-        assert_eq!(bytes.len(), MAGIC.len() + FOOTER_LEN);
+        assert_eq!(bytes.len(), MAGIC.len() + FOOTER_CHECK_LEN + FOOTER_LEN);
         let run = RunReader::new(&bytes).unwrap();
         assert_eq!(run.entry_count(), 0);
         assert_eq!(run.get(b"anything").unwrap(), None);
@@ -939,6 +1043,50 @@ mod tests {
             Err(Error::InvalidInput { .. })
         ));
         assert!(check_lengths(&long[..MAX_KEY_LEN], Entry::Value(&long[..MAX_VALUE_LEN])).is_ok());
+    }
+
+    /// The footer check catches any change to the footer, the entry count
+    /// included, which no other checksum covers.
+    #[test]
+    fn test_footer_bit_flip_is_caught_by_the_footer_check() {
+        let bytes = many(100, 16);
+        for bit in [0, 7, 40, 63] {
+            let mut bad = bytes.clone();
+            let at = bad.len() - FOOTER_LEN + bit / 8;
+            bad[at] ^= 1 << (bit % 8);
+            assert!(
+                matches!(RunReader::new(&bad), Err(Error::Corruption { reason }) if reason == "footer checksum mismatch"),
+                "bit {bit}"
+            );
+        }
+    }
+
+    /// A run written before 1.4 has no footer check and still reads; its
+    /// entry count is checked against the blocks instead, so a count no
+    /// run of its size can hold is refused.
+    #[test]
+    fn test_run_without_footer_check_reads_and_bounds_its_count() {
+        let bytes = many(100, 16);
+        let old = without_footer_check(&bytes);
+        let run = RunReader::new(&old).unwrap();
+        assert_eq!(run.entry_count(), 100);
+        assert_eq!(run.iter().count(), 100);
+        for count in [u64::MAX, 1 << 40, 10_000] {
+            let mut bad = old.clone();
+            set_entry_count(&mut bad, count);
+            assert!(
+                matches!(RunReader::new(&bad), Err(Error::Corruption { .. })),
+                "{count}"
+            );
+        }
+        // Fewer entries than blocks is no run either.
+        let mut bad = old.clone();
+        set_entry_count(&mut bad, 0);
+        assert!(RunReader::new(&bad).is_err());
+        // An empty run, old style.
+        let empty = without_footer_check(&RunWriter::new().finish());
+        assert_eq!(empty.len(), MAGIC.len() + FOOTER_LEN);
+        assert_eq!(RunReader::new(&empty).unwrap().iter().count(), 0);
     }
 
     #[test]
