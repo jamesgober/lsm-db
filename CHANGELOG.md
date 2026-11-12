@@ -31,6 +31,7 @@ their run and rebuilt when they fail. No change without `bloom`.
 
 - **A well-formed sidecar built over other keys made point reads miss keys the run holds.** A sidecar bloom-lib 1.0 wrote on a 32-bit or big-endian host is one (its hashes differ), as is one copied from another run. At open a filter must now answer "maybe" for the last key of every block in its run's index; one that does not is dropped.
 - **A sidecar that failed its checks left its run without a filter** until the run was compacted away. A dropped sidecar is now rebuilt from its run at open (one read of the run) and written again.
+- **Reopening a store right after dropping it could fail as "held"** in a process that starts child processes: a child holds a copy of each open file until it runs its program, and the directory lock belongs to the open file, so the lock outlived the handle for that moment. An open now tries a held lock again for up to 200 ms before reporting it held.
 
 ---
 
