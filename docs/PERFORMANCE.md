@@ -40,6 +40,25 @@ They will differ on your hardware; the **ratios** are the durable signal.
 
 ---
 
+## What these numbers do not show
+
+A 10,000-key working set never compacts and its flushes are small, so none of
+the figures here measure the costs that grow with a store:
+
+- **Compaction rewrites the whole store.** Each compaction merges every run
+  into one. For S bytes of data, a memtable of M bytes, and a trigger of T
+  runs, the bytes written per byte stored come to about S / (2(T - 1)M): about
+  40 at 1 GiB and about 400 at 10 GiB with the defaults (an estimate from the
+  policy, not a measurement). A compaction also needs free space equal to the
+  store's size. A size-tiered policy, then a leveled one, are planned.
+- **A flush blocks reads.** A flush holds the engine's write lock while it
+  writes the memtable, so reads and writes wait for it, for a time that grows
+  with the memtable's size. With `durability`, every write holds the lock
+  across its `fsync`. Moving the flush off the lock is planned.
+- **A scan holds its whole range in memory** before it returns.
+
+---
+
 ## Bloom filters cut negative lookups
 
 A point lookup that misses must consult each on-disk run. A per-run bloom filter
@@ -104,16 +123,17 @@ are a B-tree's home turf.
 
 ## CRC32C in every build
 
-Every data block, index block and bloom sidecar carries a CRC32C, so the
-checksum runs on every block read and write. The `std` build uses the `crc32c`
-crate, which picks the SSE4.2 or ARMv8 CRC instructions at run time; 1.1 left
-that path unchanged. A `no_std` build has no run-time CPU detection, so
-`src/crc.rs` uses the instructions when the target enables them at compile
-time and slicing-by-8 tables otherwise. From `benches/crc.rs`:
+Every data block, index block, footer (since 1.4) and bloom sidecar carries a
+CRC32C, so the checksum runs on every block read and write. Since 1.2 every
+build computes it in `src/crc.rs`: a `std` build asks the CPU at run time and
+uses the SSE4.2 or ARMv8 CRC instructions when present (before 1.2 it ran on
+the `crc32c` crate). A `no_std` build has no run-time CPU detection, so it uses
+the instructions when the target enables them at compile time and
+slicing-by-8 tables otherwise. From `benches/crc.rs`, measured at 1.1 for the
+`no_std` paths:
 
 | Build | 64 B | 4 KiB | 64 KiB |
 |-------|------|-------|--------|
-| `std` (`crc32c` crate) | 4.1 GiB/s | 7.6 GiB/s | 7.3 GiB/s |
 | `no_std`, `-C target-feature=+sse4.2` | 39 GiB/s | 38.7 GiB/s | 36.5 GiB/s |
 | `no_std`, table | 3.1 GiB/s | 2.6 GiB/s | 2.5 GiB/s |
 

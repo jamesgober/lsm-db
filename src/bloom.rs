@@ -14,6 +14,15 @@
 //! unreadable the engine simply consults the run directly, with correct (only
 //! slower) results.
 //!
+//! A sidecar is checked, not trusted. Its CRC32C detects damage, but anyone
+//! who can write the file can also compute the checksum, so the decoded
+//! filter's shape is checked as well (its bit count, word count, and hash
+//! count agree and are in range) and a filter that fails is dropped. What no
+//! check can catch is a well-formed filter built over other keys: it makes
+//! point reads miss keys that the run holds (scans still find them). The
+//! sidecar has no key; keep the database directory writable only by its
+//! owner.
+//!
 //! Everything here presents the same surface whether or not the `bloom` feature
 //! is enabled; with it off, [`RunFilter`] is a zero-sized no-op the engine calls
 //! unconditionally, so the non-bloom path pays nothing.
@@ -27,6 +36,14 @@ use std::path::{Path, PathBuf};
 pub(crate) fn sidecar_path(run_path: &Path) -> PathBuf {
     let mut name = run_path.as_os_str().to_os_string();
     name.push(".bloom");
+    PathBuf::from(name)
+}
+
+/// The temporary file a sidecar is written to before it is renamed into
+/// place.
+pub(crate) fn sidecar_tmp_path(run_path: &Path) -> PathBuf {
+    let mut name = sidecar_path(run_path).into_os_string();
+    name.push(".tmp");
     PathBuf::from(name)
 }
 
@@ -91,7 +108,7 @@ mod enabled {
 
     use bloom_lib::BloomFilter;
 
-    use super::sidecar_path;
+    use super::{sidecar_path, sidecar_tmp_path};
     use crate::error::{Error, Result};
 
     /// Target false-positive rate for a run filter. 1% keeps the filter small
@@ -117,19 +134,45 @@ mod enabled {
         filter: Option<BloomFilter<[u8]>>,
     }
 
+    /// Bits per key at [`FALSE_POSITIVE_RATE`] (`-ln(0.01) / ln(2)^2` is
+    /// 9.6), rounded up. Used only to check that a filter's memory can be had
+    /// before asking for it.
+    const BITS_PER_KEY: u64 = 10;
+
+    /// Largest hash count a sidecar may carry. The engine's filters use 7.
+    const MAX_HASHES: u32 = 32;
+
     /// Start a builder sized for `capacity` keys.
     ///
     /// `capacity` may be an over-estimate (compaction sizes from the sum of its
     /// inputs, before dedup); over-sizing only lowers the false-positive rate.
+    /// When the filter's memory cannot be allocated the run gets no filter,
+    /// which costs reads speed, not correctness. bloom-lib allocates its bit
+    /// array with an allocation that aborts the process when it fails, so the
+    /// memory is first reserved with one that reports the failure.
     pub(crate) fn builder(capacity: usize) -> RunFilterBuilder {
         // A zero-key run gets no filter. `BloomFilter::new` also rejects a zero
         // capacity, so guard it here.
-        let filter = if capacity == 0 {
+        let filter = if capacity == 0 || !can_allocate(capacity) {
             None
         } else {
             BloomFilter::new(capacity, FALSE_POSITIVE_RATE).ok()
         };
         RunFilterBuilder { filter }
+    }
+
+    /// Whether the bit array for `capacity` keys can be allocated now.
+    fn can_allocate(capacity: usize) -> bool {
+        let Some(words) = u64::try_from(capacity)
+            .ok()
+            .and_then(|n| n.checked_mul(BITS_PER_KEY))
+            .map(|bits| bits.div_ceil(64))
+            .and_then(|w| usize::try_from(w).ok())
+        else {
+            return false;
+        };
+        let mut probe: Vec<u64> = Vec::new();
+        probe.try_reserve_exact(words).is_ok()
     }
 
     impl RunFilterBuilder {
@@ -151,15 +194,16 @@ mod enabled {
     impl RunFilter {
         /// Load the filter for the run at `run_path` from its sidecar.
         ///
-        /// Returns `Ok(None)` when the sidecar is absent or fails its integrity
-        /// envelope — both are non-fatal: the run is simply consulted directly. A
+        /// Returns `Ok(None)` when the sidecar is absent or fails its checks:
+        /// both are non-fatal, and the run is simply consulted directly. A
         /// genuine I/O failure (for example a permission error) is propagated.
         ///
-        /// The envelope (magic + CRC32C over the payload) is the security
-        /// boundary: only bytes this crate actually wrote — which always encode a
-        /// self-consistent filter — are passed to the deserializer, so a
-        /// corrupt or hostile sidecar can never produce a filter that panics when
-        /// queried.
+        /// The envelope (magic + CRC32C over the payload) detects damage; it
+        /// is not a security boundary, because anyone who can write the file
+        /// can compute the checksum. So the payload's shape is read before it
+        /// is decoded and checked after: the word count matches the bit count
+        /// and the hash count is in range, which is what makes a query of the
+        /// filter safe (no index outside its bits, no unbounded hashing).
         pub(crate) fn load(run_path: &Path) -> Result<Option<RunFilter>> {
             let path = sidecar_path(run_path);
             let bytes = match fs::read(&path) {
@@ -178,7 +222,8 @@ mod enabled {
         }
 
         /// Parse a sidecar envelope, returning the filter only if the magic and
-        /// checksum both match. Any inconsistency yields `None`.
+        /// checksum match and the filter's shape is sound. Any inconsistency
+        /// yields `None`.
         fn decode(bytes: &[u8]) -> Option<BloomFilter<[u8]>> {
             // magic (8) + crc (4) + payload.
             if bytes.len() < 12 || &bytes[0..8] != SIDECAR_MAGIC {
@@ -189,7 +234,14 @@ mod enabled {
             if crate::crc::crc32c(payload) != crc {
                 return None;
             }
-            postcard::from_bytes::<BloomFilter<[u8]>>(payload).ok()
+            let shape = Shape::read(payload)?;
+            if !shape.is_sound() {
+                return None;
+            }
+            let filter = postcard::from_bytes::<BloomFilter<[u8]>>(payload).ok()?;
+            // The decoder read the same fields; check that it agrees.
+            (filter.num_bits() == shape.num_bits && filter.num_hashes() == shape.num_hashes)
+                .then_some(filter)
         }
 
         /// Write the filter to the sidecar for the run at `run_path`, atomically
@@ -198,9 +250,7 @@ mod enabled {
             let path = sidecar_path(run_path);
             let bytes = self.encode()?;
 
-            let mut tmp = path.clone().into_os_string();
-            tmp.push(".tmp");
-            let tmp = std::path::PathBuf::from(tmp);
+            let tmp = sidecar_tmp_path(run_path);
             fs::write(&tmp, &bytes).map_err(|e| Error::io("write bloom sidecar", e))?;
             fs::rename(&tmp, &path).map_err(|e| Error::io("install bloom sidecar", e))?;
             Ok(())
@@ -228,10 +278,158 @@ mod enabled {
         }
     }
 
+    /// The shape of a filter as its sidecar payload records it.
+    ///
+    /// The payload is the postcard encoding of bloom-lib 1.0's
+    /// `BloomFilter`: the bit set's words (a length, then each `u64`), the
+    /// bit count, then the hash count, every integer a LEB128 varint. The
+    /// golden sidecar test pins that layout.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Shape {
+        words: u64,
+        num_bits: u64,
+        num_hashes: u32,
+    }
+
+    impl Shape {
+        /// Walk the payload without decoding it into memory. `None` unless it
+        /// is exactly one filter, with nothing after it.
+        fn read(payload: &[u8]) -> Option<Shape> {
+            let mut pos = 0usize;
+            let words = varint(payload, &mut pos)?;
+            for _ in 0..words {
+                let _ = varint(payload, &mut pos)?;
+            }
+            let num_bits = varint(payload, &mut pos)?;
+            let num_hashes = u32::try_from(varint(payload, &mut pos)?).ok()?;
+            (pos == payload.len()).then_some(Shape {
+                words,
+                num_bits,
+                num_hashes,
+            })
+        }
+
+        /// The shape every query relies on: at least one bit, exactly enough
+        /// words for the bits, and a bounded hash count.
+        fn is_sound(self) -> bool {
+            self.num_bits > 0
+                && self.words == self.num_bits.div_ceil(64)
+                && (1..=MAX_HASHES).contains(&self.num_hashes)
+        }
+    }
+
+    /// Read one LEB128 varint of at most ten bytes (a `u64`).
+    fn varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = *bytes.get(*pos)?;
+            *pos += 1;
+            let low = u64::from(byte & 0x7F);
+            if shift == 63 && low > 1 {
+                return None; // past 64 bits
+            }
+            value |= low << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod tests {
         use super::*;
+
+        /// A sidecar for `payload`, with a valid envelope.
+        fn envelope(payload: &[u8]) -> Vec<u8> {
+            let mut bytes = SIDECAR_MAGIC.to_vec();
+            bytes.extend_from_slice(&crate::crc::crc32c(payload).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        /// LEB128 varint encoding, as postcard writes it.
+        fn leb(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (v & 0x7F) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        fn payload(words: &[u64], num_bits: u64, num_hashes: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            leb(words.len() as u64, &mut out);
+            for &w in words {
+                leb(w, &mut out);
+            }
+            leb(num_bits, &mut out);
+            leb(num_hashes, &mut out);
+            out
+        }
+
+        /// A sidecar whose checksum is right but whose filter has no words
+        /// for its bits used to decode, and the first query indexed past the
+        /// end of the bit set and panicked. One with a huge hash count made
+        /// every query hash billions of times. Both are dropped now; a sound
+        /// one still decodes.
+        #[test]
+        fn test_a_crafted_sidecar_with_a_valid_crc_is_dropped() {
+            let empty_words = envelope(&payload(&[], 1 << 40, 7));
+            assert!(RunFilter::decode(&empty_words).is_none());
+            let many_hashes = envelope(&payload(&[u64::MAX; 2], 128, u64::from(u32::MAX)));
+            assert!(RunFilter::decode(&many_hashes).is_none());
+            let no_bits = envelope(&payload(&[], 0, 7));
+            assert!(RunFilter::decode(&no_bits).is_none());
+            let trailing = {
+                let mut p = payload(&[0; 2], 128, 7);
+                p.push(0);
+                envelope(&p)
+            };
+            assert!(RunFilter::decode(&trailing).is_none());
+            let sound = envelope(&payload(&[u64::MAX; 2], 128, 7));
+            let filter = RunFilter {
+                filter: RunFilter::decode(&sound).expect("a sound filter decodes"),
+            };
+            assert!(filter.might_contain(b"anything"), "every bit is set");
+        }
+
+        /// The shape walk reads the golden sidecar the way postcard does.
+        #[test]
+        fn test_shape_of_the_golden_sidecar() {
+            let shape = Shape::read(&GOLDEN[12..]).unwrap();
+            assert!(shape.is_sound());
+            let filter = golden_filter();
+            assert_eq!(shape.num_bits, filter.filter.num_bits());
+            assert_eq!(shape.num_hashes, filter.filter.num_hashes());
+        }
+
+        #[test]
+        fn test_varint_rejects_overlong_and_truncated() {
+            let mut pos = 0;
+            assert_eq!(varint(&[0x80; 11], &mut pos), None);
+            let mut pos = 0;
+            assert_eq!(varint(&[0x80], &mut pos), None);
+            let mut out = Vec::new();
+            leb(u64::MAX, &mut out);
+            let mut pos = 0;
+            assert_eq!(varint(&out, &mut pos), Some(u64::MAX));
+            let mut pos = 0;
+            let too_big = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+            assert_eq!(varint(&too_big, &mut pos), None);
+        }
+
+        #[test]
+        fn test_builder_gives_no_filter_when_memory_cannot_be_had() {
+            assert!(!can_allocate(usize::MAX));
+            assert!(builder(usize::MAX).finish().is_none());
+            assert!(can_allocate(1000));
+        }
 
         /// The keys of the golden sidecar.
         fn golden_keys() -> Vec<Vec<u8>> {

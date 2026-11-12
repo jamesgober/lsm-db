@@ -18,6 +18,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.4.0] - 2026-11-12
+
+Fixes from an independent review: an open no longer loses or overwrites data
+it cannot account for, and the run footer, the write-ahead log, and the bloom
+sidecar are checked before they are trusted. The format version is unchanged:
+1.0 to 1.3 read the runs 1.4 writes, and 1.4 opens every existing store.
+
+### Added
+
+- `Lsm::rebuild_manifest(dir)`: writes a manifest again for a store whose manifest is lost or damaged, from the run files present, newest first by sequence number. Every run is opened and checked first; a damaged manifest is kept as `MANIFEST.old`. It refuses a store whose manifest is intact.
+- `Lsm::take_compaction_error()`: the error from the most recent failed background compaction, if any.
+- A footer check in every run written from now on: 12 bytes (`LSMFCK01` and the CRC32C of the footer) between the last data block and the index, verified when present. No data block covers those bytes, so earlier readers read these runs, and runs without the check still open. See `docs/SSTABLE_FORMAT.md`.
+- A build script detects whether the compiler has `File::try_lock` (Rust 1.89), for the directory lock.
+
+### Changed
+
+- `wal-db` 1.4. With `durability`, the log is opened with `OpenPolicy::Strict` and a record limit of two 1 GiB fields plus framing, instead of wal-db's 64 MiB default.
+- The block cache's capacity counts bytes: each block is charged the memory its decoded form holds, and a block larger than a quarter of a cache shard (128 KiB at the default 8 MiB) is not cached. A small capacity uses fewer shards so a block still fits.
+- The Cargo description, README, and docs no longer describe leveled SSTables or level sizing, which do not exist: compaction merges every run into one. Its cost (it rewrites the whole store each time) is described in the README and `docs/PERFORMANCE.md`; size-tiered and then leveled compaction are planned.
+- The docs say that a flush holds the engine lock (reads wait for it), that a scan holds its whole range in memory, and that a bloom sidecar's checksum is not authentication; stale statements about the `crc32c` crate and a lost write at exit are corrected.
+
+### Fixed
+
+- **Two handles could open one directory** and overwrite each other's runs and manifest, losing flushed writes. An open now takes an exclusive lock on a `LOCK` file for the handle's life; a second open, in the same process or another, fails with `Error::Io` whose source kind is `WouldBlock`. Rust 1.89 and later lock with `File::try_lock`; older compilers open the lock file on Windows sharing only delete access, and use a process-id lock file on Unix.
+- **A directory without a manifest was opened as a new store** whatever it held, and the files it took for orphans were removed. It is a new store now only when it is empty (a lock file, temporary files, and a `wal.log` are allowed); otherwise the open is refused and nothing is changed. Only a manifest that does not exist counts as missing: any other error reading it fails the open.
+- **An unchecked footer count could abort the process.** The footer's entry count is checked against the run's blocks at open, so a damaged count (one bit flip) is corruption instead of the size of the bloom filter the next compaction allocates. Building a filter whose memory cannot be had now gives the run no filter.
+- **A stale `wal.log` was replayed over newer data.** A build without `durability` ignored the log, so after Cargo features changed between builds, the next durable open replayed old writes over the newer ones. A build without the feature now refuses a directory whose log is not empty.
+- **A failed background compaction was silent** and left its output on disk, and a panic in it ended compaction for the handle's life. Its files are removed on any error or panic, the inputs stay live, the error is kept for `take_compaction_error`, and the next trigger tries again.
+- **Damage in the middle of the write-ahead log dropped later acknowledged writes**: the open cut the log at the damage. With intact records after the damage the open now fails with `Error::Corruption` and leaves the log as it is; a torn final record is still cut.
+- **A crafted bloom sidecar with a valid checksum** could make a point read panic or hash without bound. The filter's shape is checked after decoding (bit count, word count, hash count) and an unsound filter is dropped.
+- **A failed directory sync after a manifest install removed files the new manifest named.** Flush and compaction now keep those files and leave the live set in memory unchanged, so the next manifest written agrees with it again.
+- A manifest naming a file outside the directory is corruption; it could make a compaction delete that file. A run file named with the largest sequence number is corruption instead of an overflow.
+- A run whose header magic is wrong is refused at open, and a run whose blocks overlap is corruption when read instead of a stream of keys out of order. The run writer refuses keys out of order.
+- With `durability`, a write over 64 MiB failed with `Error::Io`; it is logged now, up to the format's limits, and a batch whose record would pass that limit is `InvalidInput`. A log that cannot be removed at a flush is kept and reused instead of leaving the handle without a log.
+
+### Security
+
+- The fuzz target for bloom sidecars wraps its input in a valid envelope half of the time, so it reaches the filter decoder.
+
+---
+
 ## [1.3.0] - 2026-11-11
 
 Range scans cost their range, not their position in the key space; `close`
@@ -509,7 +550,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/jamesgober/lsm-db/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0

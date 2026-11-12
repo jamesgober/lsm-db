@@ -18,13 +18,13 @@
 
 <div align="left">
     <p>
-        <strong>lsm-db</strong> is a <b>log-structured merge-tree</b> storage engine: the write path that powers RocksDB, LevelDB, Cassandra, and ScyllaDB, packaged as a clean Rust library. Writes go to an in-memory memtable backed by a durable log; when the memtable fills it is flushed to an immutable sorted run on disk; background compaction merges those runs to keep reads fast and space bounded.
+        <strong>lsm-db</strong> is a <b>log-structured merge-tree</b> storage engine: the write path that powers RocksDB, LevelDB, Cassandra, and ScyllaDB, packaged as a Rust library. Writes go to an in-memory memtable (logged to a write-ahead log first with the <code>durability</code> feature); when the memtable fills it is flushed to an immutable sorted run on disk; a background compaction merges the runs into one when they reach a configured count, to keep reads fast and space bounded.
     </p>
     <p>
         It is built from the portfolio's own primitives rather than re-deriving them: durability comes from <code>wal-db</code> and point-read filtering from <code>bloom-lib</code>. That keeps the engine small and lets each primitive be audited and benchmarked once.
     </p>
     <p>
-        The common case is <code>open</code> / <code>put</code> / <code>get</code> / <code>scan</code>. Compaction strategy, level sizing, and write-buffer tuning live behind a builder.
+        The common case is <code>open</code> / <code>put</code> / <code>get</code> / <code>scan</code>. The write-buffer size, the run count that triggers a compaction, and the block-cache size live behind a builder.
     </p>
     <br>
     <hr>
@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Durable writes via wal-db. Background compaction. Bloom-filtered reads.
     </p>
     <blockquote>
-        <strong>Status: 1.1 &mdash; stable.</strong> The public API is frozen until 2.0, and the on-disk run format is frozen for the 1.x series (since <code>0.3.0</code>; see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Crash-safe writes (<code>durability</code>) and bloom-filtered reads (<code>bloom</code>) ship as opt-in features, and the run format builds without <code>std</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: 1.4 &mdash; stable.</strong> The public API is frozen until 2.0, and the on-disk run format is frozen for the 1.x series (since <code>0.3.0</code>; see <a href="./docs/SSTABLE_FORMAT.md"><code>docs/SSTABLE_FORMAT.md</code></a>). Crash-safe writes (<code>durability</code>) and bloom-filtered reads (<code>bloom</code>) ship as opt-in features, and the run format builds without <code>std</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -43,9 +43,10 @@
 
 - **Memtable** &mdash; in-memory sorted write buffer; flushes to an immutable sorted run when full
 - **Multiple sorted runs** &mdash; each flush appends a run; reads merge across all of them, newest first
-- **Background compaction** &mdash; a dedicated thread merges runs to bound read amplification, concurrent with reads and writes
+- **Background compaction** &mdash; a dedicated thread merges every run into one when they reach the configured count, to bound read amplification, concurrent with reads and writes (see [Compaction](#compaction) for its cost)
 - **Frozen on-disk format** &mdash; block-structured runs with per-block CRC32C integrity; specified in [`docs/SSTABLE_FORMAT.md`](./docs/SSTABLE_FORMAT.md)
-- **Crash recovery** &mdash; a manifest records the live runs; a crash mid-flush or mid-compaction recovers to a consistent state
+- **Crash recovery** &mdash; a manifest records the live runs; a crash mid-flush or mid-compaction recovers to a consistent state, and a lost manifest can be rebuilt from the runs (`Lsm::rebuild_manifest`)
+- **One handle per directory** &mdash; a `LOCK` file is held while the store is open, so a second open, in the same process or another, is refused
 - **Tombstone deletes** &mdash; deletes mask older values and resolve away during compaction
 - **Range scans** &mdash; merge the buffer and every run into one sorted stream
 - **Grouped writes** &mdash; apply a batch atomically with respect to concurrent readers
@@ -62,10 +63,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.3"
+lsm-db = "1.4"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "1.3", features = ["durability", "bloom"] }
+lsm-db = { version = "1.4", features = ["durability", "bloom"] }
 ```
 
 ### `no_std`
@@ -73,7 +74,7 @@ lsm-db = { version = "1.3", features = ["durability", "bloom"] }
 The engine needs a filesystem, so it stays behind the default `std` feature. With `default-features = false` the crate builds on bare-metal targets and provides the run format as an in-memory codec: `format::RunWriter` and `format::RunReader` with the `alloc` feature, and `format::crc32c` and the error type without it. A run built on a device reads on a host and the other way round.
 
 ```toml
-lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
+lsm-db = { version = "1.4", default-features = false, features = ["alloc"] }
 ```
 
 CRC32C is computed identically in every build. Without `std` it uses the SSE4.2 or ARMv8 CRC instructions when the target enables them at compile time (`-C target-feature=+sse4.2` / `+crc`) and a slicing-by-8 table otherwise. See [`docs/API.md`](./docs/API.md#no_std).
@@ -123,7 +124,11 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is <code>v1.3.0</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build; 1.3 makes a range scan cost its range. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is <code>v1.4.0</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build; 1.3 makes a range scan cost its range; 1.4 locks the directory, checks the run footer, refuses a damaged log or a lost manifest instead of losing data, and reports failed compactions. The engine is soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). Corrupted and hostile run files, logs, manifests, and sidecars are checked by the adversarial tests; the threat model is a file damaged on disk or written by someone else, and it assumes the directory itself is writable only by its owner. See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+
+### Compaction
+
+Compaction merges **every** live run into one, each time the run count reaches the trigger (4 by default). There are no levels and no size tiers yet. With a memtable of M bytes and a trigger of T runs, each compaction rewrites the whole store, so for S bytes of data the bytes written per byte stored grow with S, at about S / (2(T - 1)M): about 40 for 1 GiB at the defaults and about 400 for 10 GiB (an estimate from the policy, not a measurement). A compaction also needs free space equal to the store's size. A size-tiered policy, and later a leveled one, are planned. Raising `memtable_capacity` and `compaction_trigger` lowers the cost, at the price of more memory and more runs for a read to visit.
 
 <hr>
 <br>

@@ -42,8 +42,25 @@ fn ungraceful_exit_preserves_flushed_data() {
         db.flush().unwrap();
         db.put(b"b", b"2").unwrap();
         db.flush().unwrap();
-        // Simulate a crash: skip the graceful shutdown (no Drop, no thread join).
-        std::mem::forget(db);
+        // Simulate a crash: keep the files as they are while the handle is
+        // open, then close it (which releases the directory) and put them
+        // back, so no graceful shutdown reaches the directory.
+        let saved = tempfile::tempdir().unwrap();
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() != "LOCK" {
+                let _ = fs::copy(entry.path(), saved.path().join(entry.file_name())).unwrap();
+            }
+        }
+        db.put(b"c", b"3").unwrap(); // buffered only: lost with the crash
+        drop(db);
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        for entry in fs::read_dir(saved.path()).unwrap() {
+            let entry = entry.unwrap();
+            let _ = fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+        }
     }
     let db = Lsm::open(dir.path()).unwrap();
     assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));

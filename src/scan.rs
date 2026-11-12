@@ -1,14 +1,19 @@
 //! Range iteration.
 //!
 //! [`Lsm::scan`](crate::Lsm::scan) merges the in-memory buffer and the on-disk
-//! run into one ascending key stream and returns a [`Scan`] over the entries
+//! runs into one ascending key stream and returns a [`Scan`] over the entries
 //! that fall in the requested range.
 //!
-//! For the foundation release the merge is materialised under the read lock that
-//! `scan` takes: the returned [`Scan`] is a consistent point-in-time snapshot of
-//! the range, decoupled from later writes, and iterating it never blocks writers.
-//! Streaming the merge lazily is a later optimisation (see the roadmap); the
-//! snapshot semantics it provides are part of the contract and will not change.
+//! The scan is materialised before it returns: under the read lock it copies
+//! the memtable's part of the range and takes a handle on each run, then,
+//! with no lock held, it seeks every run to the range's start and merges the
+//! range into one vector. The returned [`Scan`] is a consistent point-in-time
+//! snapshot of the range, decoupled from later writes, and iterating it never
+//! blocks writers. It also holds the whole range in memory at once, so a range
+//! larger than memory cannot be scanned in one call; scan such a store in
+//! pieces (for example by prefix, or by a key range at a time). Streaming the
+//! merge lazily is planned; the snapshot semantics are part of the contract
+//! and will not change.
 
 /// An ascending iterator over a key range, returned by
 /// [`Lsm::scan`](crate::Lsm::scan).

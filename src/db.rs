@@ -10,10 +10,14 @@
 //!
 //! Engine state — the memtable and the ordered list of runs — lives behind a
 //! single [`RwLock`]. Reads snapshot what they need (a value, or the run handles
-//! and a memtable slice) under a brief read lock, then do their file I/O without
-//! holding it. Writes take the write lock. Compaction does its expensive merge
-//! with no lock held and takes the write lock only to swap the finished run in,
-//! so it never blocks reads or writes for more than that swap. A run removed by
+//! and a memtable slice) under the read lock, then do their file I/O without
+//! holding it. Writes take the write lock. A flush holds the write lock while
+//! it writes the memtable as a run and installs it, so reads and writes wait
+//! for a flush (its time grows with the memtable's size), and with the
+//! `durability` feature every write holds it across its log `fsync`.
+//! Compaction does its expensive merge with no lock held and takes the write
+//! lock only to swap the finished run in and write the manifest (one small
+//! file and its `fsync`). A run removed by
 //! compaction is reference counted: its file is deleted only when the last reader
 //! still holding it has finished (see [`SsTable`]'s `Drop`).
 
@@ -32,6 +36,7 @@ use crate::config::LsmConfig;
 use crate::durability::Durability;
 use crate::error::{Error, Result};
 use crate::format;
+use crate::lock::{DirLock, LOCK_FILE};
 use crate::manifest::{self, Manifest};
 use crate::memtable::MemTable;
 use crate::merge::Merge;
@@ -81,6 +86,9 @@ struct Engine {
     /// Shared cache of decoded data blocks, consulted by point lookups across
     /// every run.
     cache: Arc<BlockCache>,
+    /// Make the next compaction of this engine panic. Test-only.
+    #[cfg(test)]
+    inject_panic: AtomicBool,
 }
 
 /// A log-structured merge-tree key-value store backed by a directory on disk.
@@ -127,6 +135,43 @@ struct Engine {
 pub struct Lsm {
     engine: Arc<Engine>,
     compactor: Option<JoinHandle<()>>,
+    /// Held for the handle's life; dropped last, after the final flush.
+    _lock: DirLock,
+}
+
+/// Where [`Lsm::rebuild_manifest`] keeps a manifest it replaces.
+const MANIFEST_OLD: &str = "MANIFEST.old";
+
+/// Name of the write-ahead log file (`durability`), which a store that never
+/// flushed may hold without a manifest.
+const WAL_FILE: &str = "wal.log";
+
+/// Check that `dir`, which has no manifest, holds no store: nothing but the
+/// lock file, temporary files, and a write-ahead log (a store from before
+/// 1.3, which wrote its manifest at the first flush, may have only a log).
+fn check_new_store(dir: &Path) -> Result<()> {
+    let mut foreign = false;
+    for entry in fs::read_dir(dir).map_err(|e| Error::io("scan database directory", e))? {
+        let entry = entry.map_err(|e| Error::io("read directory entry", e))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if manifest::seq_of(&name).is_some() {
+            return Err(Error::corruption(
+                "MANIFEST is missing but run files exist; restore it from a backup or rebuild it \
+                 with Lsm::rebuild_manifest",
+            ));
+        }
+        if !(name == LOCK_FILE || name == WAL_FILE || name.ends_with(".tmp")) {
+            foreign = true;
+        }
+    }
+    if foreign {
+        return Err(Error::invalid_input(
+            "the directory has no MANIFEST and is not empty; a new store needs an empty \
+             directory",
+        ));
+    }
+    Ok(())
 }
 
 impl Lsm {
@@ -136,6 +181,30 @@ impl Lsm {
     /// The run set recorded in the manifest is reopened, so flushed data is
     /// visible immediately. Temporary files and run files orphaned by a crash
     /// mid-flush or mid-compaction are reclaimed.
+    ///
+    /// The handle holds the directory: a `LOCK` file in it is locked until the
+    /// handle is dropped or [`close`](Lsm::close)d, and a second open of the
+    /// directory, in this process or another, fails until then. A directory
+    /// without a `MANIFEST` is a new store only when it is empty (a `LOCK`
+    /// file, temporary files, and a `wal.log` are allowed); otherwise the open
+    /// is refused and nothing in the directory is changed or removed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] whose source has kind
+    ///   [`WouldBlock`](std::io::ErrorKind::WouldBlock) when another handle
+    ///   has the directory open; [`Error::Io`] when the directory or a file
+    ///   in it cannot be read or written.
+    /// - [`Error::Corruption`] when the manifest is malformed, names a run
+    ///   that is missing or fails its checks, or is missing while run files
+    ///   exist (see [`rebuild_manifest`](Lsm::rebuild_manifest)), and, with
+    ///   `durability`, when the write-ahead log is damaged before its last
+    ///   record.
+    /// - [`Error::InvalidInput`] when a directory without a manifest holds
+    ///   other files, and, in a build without `durability`, when the
+    ///   directory holds a non-empty `wal.log`: writes logged by a durable
+    ///   build that this build cannot replay. Open it with the `durability`
+    ///   feature first.
     ///
     /// # Examples
     ///
@@ -168,28 +237,41 @@ impl Lsm {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|e| Error::io("create database directory", e))?;
 
+        // The checks that can refuse a directory run first, reading only, so
+        // a refused directory is left as it was. They run again below with
+        // the lock held, which is what makes them hold.
+        Durability::check(&dir)?;
+        if Manifest::load(&dir)?.is_none() {
+            check_new_store(&dir)?;
+        }
+
+        // One handle per directory: a second one would hand out the same run
+        // names and overwrite this one's runs and manifest.
+        let lock = DirLock::acquire(&dir)?;
+
+        // Without the `durability` feature, a log this build cannot replay
+        // refuses the open.
+        Durability::check(&dir)?;
         let manifest = Manifest::load(&dir)?;
+        if manifest.is_none() {
+            // Every store writes its manifest when it is created, so a
+            // directory without one is a new store only when it is empty.
+            check_new_store(&dir)?;
+        }
+        // Open the write-ahead log before anything in the directory changes,
+        // so a damaged log refuses the open with nothing removed.
+        let mut durability = Durability::open(&dir)?;
         let (run_names, manifest_seq) = match manifest {
             Some(m) => (m.runs, m.next_seq),
             None => {
-                // Every store writes its manifest when it is created, so run
-                // files without one mean the manifest was lost: deleting the
-                // runs as orphans would lose their data. Refuse instead.
-                for entry in
-                    fs::read_dir(&dir).map_err(|e| Error::io("scan database directory", e))?
-                {
-                    let entry = entry.map_err(|e| Error::io("read directory entry", e))?;
-                    if manifest::seq_of(&entry.file_name().to_string_lossy()).is_some() {
-                        return Err(Error::corruption(
-                            "MANIFEST is missing but run files exist; restore it from a backup",
-                        ));
-                    }
-                }
                 Manifest::store(&dir, 0, &[])?;
                 (Vec::new(), 0)
             }
         };
         let live: HashSet<&str> = run_names.iter().map(String::as_str).collect();
+        if live.len() != run_names.len() {
+            return Err(Error::corruption("manifest names a run twice"));
+        }
 
         // Shared block cache for point lookups, sized from the config.
         let cache = BlockCache::new(config.block_cache_capacity_bytes());
@@ -201,17 +283,22 @@ impl Lsm {
         let mut runs = Vec::with_capacity(run_names.len());
         for name in &run_names {
             let path = dir.join(name);
-            if !path.exists() {
-                return Err(Error::corruption("manifest references a missing run"));
-            }
-            let mut table = SsTable::open(&path)?;
+            let mut table = match SsTable::open(&path) {
+                Ok(table) => table,
+                Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::corruption("manifest references a missing run"));
+                }
+                Err(err) => return Err(err),
+            };
             table.attach_filter(RunFilter::load(&path)?);
             table.attach_cache(Arc::clone(&cache));
             runs.push(Arc::new(table));
         }
 
         // Reclaim orphans (temporaries and runs no longer in the manifest) and
-        // make sure the next sequence number is past every file on disk.
+        // make sure the next sequence number is past every file on disk. The
+        // manifest was read and every run it names opened, so a run file it
+        // does not name is not live.
         let mut next_seq = manifest_seq;
         let mut removed = false;
         for entry in fs::read_dir(&dir).map_err(|e| Error::io("scan database directory", e))? {
@@ -229,7 +316,10 @@ impl Lsm {
                     removed = true;
                 }
             } else if let Some(seq) = manifest::seq_of(&name) {
-                next_seq = next_seq.max(seq + 1);
+                let after = seq
+                    .checked_add(1)
+                    .ok_or_else(|| Error::corruption("run sequence number at its maximum"))?;
+                next_seq = next_seq.max(after);
                 if !live.contains(name.as_str()) {
                     fs::remove_file(entry.path()).map_err(|e| Error::io("remove orphan run", e))?;
                     removed = true;
@@ -240,9 +330,8 @@ impl Lsm {
             crate::fault::sync_dir(&dir)?;
         }
 
-        // Open the write-ahead log and replay any writes not yet flushed into a
-        // fresh memtable. With the `durability` feature off this is a no-op.
-        let durability = Durability::open(&dir)?;
+        // Replay any writes not yet flushed into a fresh memtable. With the
+        // `durability` feature off this is a no-op.
         let mut memtable = MemTable::new();
         durability.replay(&mut memtable)?;
 
@@ -260,6 +349,8 @@ impl Lsm {
             cond: Condvar::new(),
             last_error: Mutex::new(None),
             cache,
+            #[cfg(test)]
+            inject_panic: AtomicBool::new(false),
         });
 
         // Checkpoint recovered writes: persist them as a run and empty the log,
@@ -277,7 +368,153 @@ impl Lsm {
         Ok(Lsm {
             engine,
             compactor: Some(compactor),
+            _lock: lock,
         })
+    }
+
+    /// Write a new manifest for the store in `dir` from the run files in it,
+    /// for a store whose manifest is lost or damaged. Returns the number of
+    /// runs the new manifest names.
+    ///
+    /// [`open`](Lsm::open) refuses a directory that holds run files but no
+    /// manifest, and deletes nothing. This is the explicit recovery: every
+    /// `run-<seq>.sst` file is opened and checked, and the runs are recorded
+    /// newest first by their sequence number. That is the order the engine
+    /// gives them: a flush or compaction takes the next number when it
+    /// starts, and a compaction merges every run that exists at that moment.
+    /// A damaged manifest is kept as `MANIFEST.old`. The write-ahead log
+    /// (`durability`) is left as it is; the next open replays it over the
+    /// runs.
+    ///
+    /// The directory may still hold run files that a flush or compaction
+    /// left when it failed before its commit; an open would have removed
+    /// them, and the rebuilt manifest names them too. A compaction's leftover
+    /// output only repeats its inputs. A failed flush's leftover run holds
+    /// writes that the engine kept in memory and wrote again in a later run,
+    /// so the leftover is older than that run; but a key in it that was
+    /// deleted later and dropped by a compaction since then reads back.
+    /// Check the data after a rebuild.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `dir` has a manifest that reads and whose
+    ///   runs all exist: there is nothing to rebuild, and a rebuild would
+    ///   bring back run files that the manifest dropped.
+    /// - [`Error::Corruption`] if a run file fails its checks. Nothing is
+    ///   written, so the file can be moved aside and the rebuild run again.
+    /// - [`Error::Io`] if the directory or an existing manifest cannot be read
+    ///   (an unreadable manifest is not replaced) or the new manifest cannot be
+    ///   written, and the error [`open`](Lsm::open) returns when another
+    ///   handle has the directory open.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// db.put(b"k", b"v")?;
+    /// db.close()?;
+    ///
+    /// std::fs::remove_file(dir.path().join("MANIFEST"))?;
+    /// assert!(lsm_db::Lsm::open(dir.path()).is_err());
+    ///
+    /// assert_eq!(lsm_db::Lsm::rebuild_manifest(dir.path())?, 1);
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rebuild_manifest(dir: impl AsRef<Path>) -> Result<usize> {
+        let dir = dir.as_ref();
+        let _lock = DirLock::acquire(dir)?;
+
+        match Manifest::load(dir) {
+            Ok(Some(manifest)) => {
+                let mut all_present = true;
+                for name in &manifest.runs {
+                    match fs::metadata(dir.join(name)) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => all_present = false,
+                        Err(e) => return Err(Error::io("stat run file", e)),
+                    }
+                }
+                if all_present {
+                    return Err(Error::invalid_input(
+                        "the manifest is intact; there is nothing to rebuild",
+                    ));
+                }
+            }
+            // Missing or damaged: rebuild.
+            Ok(None) | Err(Error::Corruption { .. }) => {}
+            // A manifest that could not be read is not replaced.
+            Err(err) => return Err(err),
+        }
+
+        let mut seqs = Vec::new();
+        for entry in fs::read_dir(dir).map_err(|e| Error::io("scan database directory", e))? {
+            let entry = entry.map_err(|e| Error::io("read directory entry", e))?;
+            if let Some(seq) = manifest::seq_of(&entry.file_name().to_string_lossy()) {
+                seqs.push(seq);
+            }
+        }
+        // Newest first.
+        seqs.sort_unstable_by(|a, b| b.cmp(a));
+        let next_seq = match seqs.first() {
+            Some(&newest) => newest
+                .checked_add(1)
+                .ok_or_else(|| Error::corruption("run sequence number at its maximum"))?,
+            None => 0,
+        };
+        let names: Vec<String> = seqs
+            .iter()
+            .map(|&seq| manifest::run_filename(seq))
+            .collect();
+        for name in &names {
+            // The footer and index checks every open makes; each block is
+            // checked when it is read.
+            let _ = SsTable::open(&dir.join(name))?;
+        }
+
+        let current = dir.join(manifest::MANIFEST);
+        match fs::metadata(&current) {
+            Ok(_) => fs::rename(&current, dir.join(MANIFEST_OLD))
+                .map_err(|e| Error::io("keep the old manifest", e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io("stat manifest", e)),
+        }
+        Manifest::store(dir, next_seq, &names)?;
+        Ok(names.len())
+    }
+
+    /// Take the error the most recent failed background compaction returned,
+    /// if one failed since the last call; `None` when none has.
+    ///
+    /// Compaction runs on its own thread, so its errors (a full disk, a
+    /// damaged run, a panic inside the merge) reach no caller directly. A
+    /// failed compaction changes nothing: every run it read stays live, the
+    /// files it wrote are removed, and the next flush that reaches the
+    /// trigger tries again. Reads and writes go on working. Poll this to
+    /// notice a compaction that keeps failing, for example while the number
+    /// of runs, and so the cost of a read, grows.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// assert!(db.take_compaction_error().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn take_compaction_error(&self) -> Option<Error> {
+        self.engine
+            .last_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     /// Set `key` to `value`, overwriting any previous value.
@@ -684,32 +921,34 @@ impl Engine {
         let name = manifest::run_filename(seq);
         let tmp = self.dir.join(format!("{name}.tmp"));
         let final_path = self.dir.join(&name);
+        // Until the manifest names the run, every file this flush makes is
+        // removed on an error.
+        let mut cleanup = Cleanup::new([
+            tmp.clone(),
+            final_path.clone(),
+            bloom::sidecar_path(&final_path),
+            bloom::sidecar_tmp_path(&final_path),
+        ]);
 
         // The memtable stays as it is until the manifest names the new run:
         // a flush that fails anywhere before leaves every write readable,
         // and the next flush tries again.
-        let installed = self
-            .write_run(&inner.memtable, &tmp, &final_path)
-            .and_then(|table| {
-                let run = Arc::new(table);
-                let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
-                new_runs.push(run);
-                new_runs.extend(inner.runs.iter().cloned());
-                let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
-                Manifest::store(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
-                Ok(new_runs)
-            });
-        let new_runs = match installed {
-            Ok(new_runs) => new_runs,
-            Err(err) => {
-                // Best effort: the files are orphans the next open would
-                // remove anyway.
-                let _ = fs::remove_file(&tmp);
-                let _ = fs::remove_file(&final_path);
-                let _ = fs::remove_file(bloom::sidecar_path(&final_path));
-                return Err(err);
-            }
-        };
+        let table = self.write_run(&inner.memtable, &tmp, &final_path)?;
+        let run = Arc::new(table);
+        let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
+        new_runs.push(run);
+        new_runs.extend(inner.runs.iter().cloned());
+        let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
+        Manifest::install(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
+        // The manifest on disk names the run now, so its files stay whatever
+        // happens next. If the directory sync fails the flush still fails and
+        // the memtable is kept: the next flush writes it again and its
+        // manifest leaves this run out, so the run is an orphan that the next
+        // open removes. A crash before that finds either manifest, each
+        // consistent with the files on disk.
+        cleanup.disarm();
+        crate::fault::check("sync manifest directory")?;
+        crate::fault::sync_dir(&self.dir)?;
         inner.runs = new_runs;
         let _ = inner.memtable.take();
 
@@ -738,8 +977,9 @@ impl Engine {
         crate::fault::check("install flushed run")?;
         fs::rename(tmp, final_path).map_err(|e| Error::io("install flushed run", e))?;
 
-        // Write the bloom sidecar before the manifest commit, so any run the
-        // manifest names is guaranteed to have its sidecar on disk.
+        // Write the bloom sidecar before the manifest commit. It is not
+        // synced: a sidecar lost or torn by a power loss fails its checksum
+        // and the run is read without a filter.
         let filter = filter.finish();
         if let Some(filter) = &filter {
             filter.write_sidecar(final_path)?;
@@ -762,9 +1002,15 @@ impl Engine {
         if self.compacting.swap(true, Ordering::AcqRel) {
             return Ok(()); // another compaction is already running
         }
-        let result = self.compact_inner();
-        self.compacting.store(false, Ordering::Release);
-        result
+        // Cleared however the compaction ends, a panic included.
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _running = Running(&self.compacting);
+        self.compact_inner()
     }
 
     fn compact_inner(&self) -> Result<()> {
@@ -778,9 +1024,10 @@ impl Engine {
             inner.runs.clone()
         };
 
-        // Size the output filter from the sum of input entry counts — an upper
+        // Size the output filter from the sum of input entry counts: an upper
         // bound (dedup only lowers the real count), so the filter is never
-        // under-sized.
+        // under-sized. Each count was checked against its run's size at open,
+        // so the sum is bounded by the bytes the inputs hold.
         let capacity: usize = inputs
             .iter()
             .map(|r| usize::try_from(r.entry_count()).unwrap_or(usize::MAX))
@@ -791,6 +1038,14 @@ impl Engine {
         let name = manifest::run_filename(seq);
         let tmp = self.dir.join(format!("{name}.tmp"));
         let final_path = self.dir.join(&name);
+        // Every file this compaction makes is removed unless the manifest
+        // names the output, on an error and on a panic alike.
+        let mut cleanup = Cleanup::new([
+            tmp.clone(),
+            final_path.clone(),
+            bloom::sidecar_path(&final_path),
+            bloom::sidecar_tmp_path(&final_path),
+        ]);
         let mut filter = bloom::builder(capacity);
         {
             let mut writer = SsTableWriter::create(&tmp)?;
@@ -802,8 +1057,14 @@ impl Engine {
                 writer.push(&key, &Record::Value(value))?;
                 filter.add(&key);
             }
+            #[cfg(test)]
+            if self.inject_panic.swap(false, Ordering::SeqCst) {
+                panic!("injected compaction panic");
+            }
+            crate::fault::check("write compacted run")?;
             writer.finish()?;
         }
+        crate::fault::check("install compacted run")?;
         fs::rename(&tmp, &final_path).map_err(|e| Error::io("install compacted run", e))?;
 
         let filter = filter.finish();
@@ -829,9 +1090,17 @@ impl Engine {
             new_runs.push(Arc::clone(&output));
 
             let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
-            // The manifest rename is the commit point. If it fails the output is
-            // an orphan the next open reclaims, and the live set is unchanged.
-            Manifest::store(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
+            // The manifest rename is the commit point. If it fails the output
+            // is removed and the live set is unchanged.
+            Manifest::install(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
+            // From here the manifest on disk names the output, so it stays.
+            // A failed directory sync leaves the live set unchanged in memory:
+            // the inputs stay live, and the next manifest written names them
+            // again, which leaves the output an orphan for the next open. A
+            // crash before that finds either manifest, each one complete.
+            cleanup.disarm();
+            crate::fault::check("sync manifest directory")?;
+            crate::fault::sync_dir(&self.dir)?;
             for input in &inputs {
                 input.mark_obsolete();
             }
@@ -858,6 +1127,36 @@ impl Engine {
     }
 }
 
+/// Files a flush or compaction made, removed on drop unless the manifest
+/// came to name them.
+struct Cleanup {
+    paths: [PathBuf; 4],
+    armed: bool,
+}
+
+impl Cleanup {
+    fn new(paths: [PathBuf; 4]) -> Self {
+        Cleanup { paths, armed: true }
+    }
+
+    /// Keep the files: the manifest names them.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best effort: what stays behind is an orphan the next open
+            // removes.
+            for path in &self.paths {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// The background compaction loop: wait for work, compact, repeat until shutdown.
 fn compactor_loop(engine: &Engine) {
     loop {
@@ -873,7 +1172,17 @@ fn compactor_loop(engine: &Engine) {
             state.running = true;
         }
 
-        let result = engine.compact_once();
+        // A panic inside the merge (a bug, or a run crafted to cause one)
+        // ends this attempt, not the thread: it is reported like an error
+        // and the next trigger tries again.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compact_once()))
+                .unwrap_or_else(|_| {
+                    Err(Error::io(
+                        "run background compaction",
+                        std::io::Error::other("the compaction panicked"),
+                    ))
+                });
 
         {
             let mut state = engine.compaction.lock().unwrap_or_else(|p| p.into_inner());
@@ -887,7 +1196,7 @@ fn compactor_loop(engine: &Engine) {
     }
 }
 
-/// Where a key sits relative to a range.
+// Where a key sits relative to a range.
 enum Pos {
     Below,
     In,
@@ -1028,6 +1337,105 @@ mod tests {
             Err(Error::Corruption { .. })
         ));
         assert_eq!(runs(), 1, "the run must not be deleted");
+    }
+
+    /// The names of the files in `dir`.
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every run the manifest on disk names exists.
+    fn manifest_runs_exist(dir: &Path) -> bool {
+        Manifest::load(dir)
+            .unwrap()
+            .unwrap()
+            .runs
+            .iter()
+            .all(|r| dir.join(r).exists())
+    }
+
+    /// A compaction that fails before its commit removes every file it made
+    /// and leaves the live set as it was; the next one succeeds.
+    #[test]
+    fn test_a_failed_compaction_removes_its_files() {
+        for point in ["write compacted run", "install compacted run"] {
+            let (dir, db) = db_no_autocompact();
+            for i in 0..3u32 {
+                db.put(format!("k{i}"), b"v").unwrap();
+                db.flush().unwrap();
+            }
+            let before = file_names(dir.path());
+            crate::fault::arm(point);
+            assert!(db.compact_now().is_err(), "{point}");
+            assert_eq!(file_names(dir.path()), before, "{point}");
+            assert_eq!(db.run_count(), 3);
+            assert_eq!(db.scan(..).unwrap().count(), 3);
+            db.compact_now().unwrap();
+            assert_eq!(db.run_count(), 1);
+        }
+    }
+
+    /// A directory sync that fails after the new manifest is in place: the
+    /// operation fails, but no file the manifest on disk names is removed,
+    /// and the live set in memory is unchanged, so the next manifest
+    /// written agrees with it again. Before 1.4 a flush removed the run the
+    /// new manifest named, and a crash then left a store that would not
+    /// open.
+    #[test]
+    fn test_a_failed_sync_after_the_manifest_keeps_what_it_names() {
+        let (dir, db) = db_no_autocompact();
+        db.put(b"a", b"1").unwrap();
+        db.flush().unwrap();
+        db.put(b"b", b"2").unwrap();
+        crate::fault::arm("sync manifest directory");
+        assert!(db.flush().is_err());
+        assert!(manifest_runs_exist(dir.path()));
+        assert_eq!(db.run_count(), 1);
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+
+        db.flush().unwrap();
+        assert!(manifest_runs_exist(dir.path()));
+        crate::fault::arm("sync manifest directory");
+        assert!(db.compact_now().is_err());
+        assert!(manifest_runs_exist(dir.path()));
+        assert_eq!(db.run_count(), 2);
+        db.compact_now().unwrap();
+        drop(db);
+        let db = Lsm::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    /// A panic inside a background compaction is caught and reported; the
+    /// compactor goes on, and the next compaction succeeds. Before 1.4 the
+    /// thread died and no compaction ran again for the handle's life.
+    #[test]
+    fn test_a_compaction_panic_is_reported_and_the_compactor_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Lsm::open_with(dir.path(), LsmConfig::new().compaction_trigger(2)).unwrap();
+        db.engine.inject_panic.store(true, Ordering::SeqCst);
+        for i in 0..2u32 {
+            db.put(format!("k{i}"), b"v").unwrap();
+            db.flush().unwrap();
+        }
+        db.wait_for_idle();
+        let err = db.take_compaction_error().expect("the panic is reported");
+        assert!(err.to_string().contains("panicked"), "{err}");
+        assert!(!db.engine.compacting.load(Ordering::Acquire));
+        assert_eq!(db.run_count(), 2);
+        assert!(file_names(dir.path()).iter().all(|n| !n.ends_with(".tmp")));
+
+        db.put(b"k2", b"v").unwrap();
+        db.flush().unwrap();
+        db.wait_for_idle();
+        assert!(db.take_compaction_error().is_none());
+        assert_eq!(db.run_count(), 1);
+        assert_eq!(db.scan(..).unwrap().count(), 3);
     }
 
     #[test]

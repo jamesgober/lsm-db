@@ -69,6 +69,14 @@
 //! [`flush`](Lsm::flush)ing are durable only with the `durability` feature: it
 //! logs every write to a `wal-db` write-ahead log before acknowledging it and
 //! replays the log on open, so no acknowledged write is lost across a crash.
+//! A log damaged before its last record refuses the open instead of losing the
+//! writes after the damage.
+//!
+//! An open handle holds its directory (a locked `LOCK` file): a second open,
+//! in this process or another, fails until the first handle is dropped. An
+//! open never deletes a run it cannot account for: a directory without a
+//! manifest is a new store only when it is empty, and a store whose manifest
+//! was lost is refused until [`Lsm::rebuild_manifest`] writes one again.
 //!
 //! ## Feature flags
 //!
@@ -90,7 +98,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
+//! lsm-db = { version = "1.4", default-features = false, features = ["alloc"] }
 //! ```
 //!
 //! CRC32C is part of the format, so every build computes identical checksums.
@@ -167,6 +175,8 @@ mod error;
 #[cfg(feature = "std")]
 mod fault;
 pub mod format;
+#[cfg(feature = "std")]
+mod lock;
 #[cfg(feature = "std")]
 mod manifest;
 #[cfg(feature = "std")]

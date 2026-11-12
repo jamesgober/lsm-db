@@ -17,7 +17,7 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: `1.3.0`, stable. API frozen until 2.0.** The surface below is frozen
+> **Status: `1.4.0`, stable. API frozen until 2.0.** The surface below is frozen
 > — no breaking change — over a multi-run engine with background compaction, a
 > block cache, optional crash-safe writes (`durability`), and optional
 > bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x
@@ -52,6 +52,8 @@
     - [`Lsm::scan_prefix`](#lsmscan_prefix)
     - [`Lsm::flush`](#lsmflush)
     - [`Lsm::close`](#lsmclose)
+    - [`Lsm::rebuild_manifest`](#lsmrebuild_manifest)
+    - [`Lsm::take_compaction_error`](#lsmtake_compaction_error)
   - [`LsmConfig`](#lsmconfig)
   - [`DEFAULT_MEMTABLE_CAPACITY`](#default_memtable_capacity)
   - [`DEFAULT_COMPACTION_TRIGGER`](#default_compaction_trigger)
@@ -77,7 +79,7 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.3"
+lsm-db = "1.4"
 ```
 
 The engine requires the standard library, which is on by default. See
@@ -164,14 +166,33 @@ session is reopened, so flushed data is visible immediately. A leftover
 temporary file from a flush interrupted by a crash is discarded — the previous
 run remains authoritative.
 
+The handle holds the directory (since 1.4): a `LOCK` file in it is locked
+until the handle is dropped or closed, and a second open of the directory, in
+this process or another, fails until then. A directory without a `MANIFEST` is
+a new store only when it is empty (a `LOCK` file, temporary files, and a
+`wal.log` are allowed); any other content refuses the open, and nothing in the
+directory is changed or removed. A store whose manifest was lost is refused,
+with its runs kept, until [`rebuild_manifest`](#lsmrebuild_manifest) writes
+one again.
+
 **Parameters**
 
 - `dir` — the database directory. Anything that is `AsRef<Path>` works: a
   `&str`, `String`, `Path`, or `PathBuf`.
 
-**Returns** an [`Lsm`], or an [`Error::Io`](#error--result) if the directory
-cannot be created, or [`Error::Corruption`](#error--result) if an existing run
-is damaged.
+**Returns** an [`Lsm`], or:
+
+- [`Error::Io`](#error--result) if the directory or a file in it cannot be
+  read or written. When another handle has the directory open, the source's
+  kind is `std::io::ErrorKind::WouldBlock`.
+- [`Error::Corruption`](#error--result) if the manifest is malformed, names a
+  run that is missing or fails its checks, or is missing while run files
+  exist, or (with `durability`) if the write-ahead log is damaged before its
+  last record.
+- [`Error::InvalidInput`](#error--result) if a directory without a manifest
+  holds other files, or, in a build without `durability`, if the directory's
+  `wal.log` is not empty: it holds writes a durable build logged, which this
+  build cannot replay. Open the directory with the feature first.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -412,9 +433,15 @@ assert_eq!(prefix, vec![(b"b".to_vec(), b"2".to_vec())]);
 pub fn flush(&self) -> Result<()>
 ```
 
-Force the in-memory buffer to disk, merging it into the sorted run. Flushing an
-empty buffer is a no-op. After a successful flush every previously written key
-is durable and will be read back on reopen.
+Force the in-memory buffer to disk as a new sorted run. Flushing an empty
+buffer is a no-op. After a successful flush every previously written key is
+durable and will be read back on reopen.
+
+A flush that fails returns its error and keeps every write in the buffer; the
+next flush tries again. A write that fills the buffer flushes it, so `put`,
+`delete`, and `write` can return a flush error for a write that was applied:
+it is in the buffer (and, with `durability`, in the log) and reads see it.
+Retrying a `put` or `delete` is harmless.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -449,6 +476,78 @@ db.put(b"k", b"v")?;
 db.close()?;
 let db = lsm_db::Lsm::open(dir.path())?;
 assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+# Ok(())
+# }
+```
+
+#### `Lsm::rebuild_manifest`
+
+```rust
+pub fn rebuild_manifest(dir: impl AsRef<Path>) -> Result<usize>
+```
+
+Since 1.4. Write a new manifest for the store in `dir` from the run files in
+it, for a store whose manifest is lost or damaged, and return the number of
+runs it names. [`open`](#lsmopen) refuses such a store and deletes nothing;
+this is the explicit recovery.
+
+Every `run-<seq>.sst` file is opened and checked, and the runs are recorded
+newest first by sequence number, the order the engine gives them: a flush or
+compaction takes the next number when it starts, and a compaction merges every
+run that exists then. A damaged manifest is kept as `MANIFEST.old`. The
+write-ahead log is left as it is; the next open replays it over the runs.
+
+The directory may still hold run files that a flush or compaction left when it
+failed before its commit (an open would have removed them); the rebuilt
+manifest names them too. A compaction's leftover output only repeats its
+inputs. A failed flush's leftover run holds writes the engine kept in memory
+and wrote again later, so it is older than that later run; but a key in it
+that was deleted afterwards and then dropped by a compaction reads back.
+Check the data after a rebuild.
+
+**Errors:** `InvalidInput` if the manifest reads and all its runs exist
+(nothing to rebuild; a rebuild would bring back runs it dropped);
+`Corruption` if a run fails its checks, in which case nothing is written; `Io`
+otherwise, including when the directory is open in another handle.
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+db.put(b"k", b"v")?;
+db.close()?;
+
+std::fs::remove_file(dir.path().join("MANIFEST"))?;
+assert!(lsm_db::Lsm::open(dir.path()).is_err()); // refused, runs kept
+
+assert_eq!(lsm_db::Lsm::rebuild_manifest(dir.path())?, 1);
+let db = lsm_db::Lsm::open(dir.path())?;
+assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+# Ok(())
+# }
+```
+
+#### `Lsm::take_compaction_error`
+
+```rust
+pub fn take_compaction_error(&self) -> Option<Error>
+```
+
+Since 1.4. Take the error from the most recent failed background compaction,
+if one failed since the last call. Compaction runs on its own thread, so its
+errors (a full disk, a damaged run, a panic inside the merge) reach no caller
+directly. A failed compaction changes nothing: every run it read stays live,
+the files it wrote are removed, and the next flush that reaches the trigger
+tries again; reads and writes go on. Poll this to notice a compaction that
+keeps failing while the run count, and so the cost of a read, grows.
+
+```rust
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let dir = tempfile::tempdir()?;
+let db = lsm_db::Lsm::open(dir.path())?;
+if let Some(err) = db.take_compaction_error() {
+    eprintln!("background compaction failed: {err}");
+}
 # Ok(())
 # }
 ```
@@ -507,12 +606,21 @@ flushes after every write — useful in tests, rarely otherwise.
 The compaction trigger bounds read amplification: each flush adds a run, and a
 point read may consult every run, so the engine merges the runs into one in the
 background once there are this many. Smaller values keep reads fast at the cost
-of more compaction work.
+of more compaction work. Every compaction merges all the runs, so it rewrites
+the whole store: for a store of S bytes, a memtable of M bytes, and a trigger of
+T runs, the bytes written per byte stored come to about S / (2(T - 1)M) (an
+estimate from the policy, not a measurement), and a compaction needs free space
+equal to the store's size. There are no levels or size tiers yet; both are
+planned.
 
 The block cache (default 8 MiB) keeps recently-read decoded run blocks so a
 repeat point lookup over a hot working set returns with no I/O, checksum, or
 parse. It is shared across all of an engine's runs; set the capacity to `0` to
-disable it.
+disable it. Since 1.4 the capacity bounds bytes: each block is charged the
+memory its decoded form holds, and a block larger than a quarter of a cache
+shard (128 KiB at the default capacity) is not cached. Before 1.4 the capacity
+counted 4 KiB slots, so blocks of large values could hold many times the
+configured bytes.
 
 ```rust
 use lsm_db::LsmConfig;
@@ -685,8 +793,8 @@ so a `match` over it must include a wildcard arm.
 | Variant | Meaning | Caller action |
 |---------|---------|---------------|
 | `Io` | An underlying I/O operation failed. `context` names what was attempted; the original `io::Error` is the [`source`](https://doc.rust-lang.org/std/error/trait.Error.html#method.source). Only with `std`. | Inspect the OS error kind (disk full, permission denied) via the source. May be retryable. |
-| `Corruption` | An on-disk run is not intact (bad magic, implausible length, truncation, checksum mismatch). | Not retryable; the bytes on disk are damaged. |
-| `InvalidInput` | The caller passed something the format cannot store: a key or value over 1 GiB, or keys out of order in a [`RunWriter`](#runwriter). Nothing was written. *(since 1.1)* | Fix the input and retry. |
+| `Corruption` | An on-disk file is not intact: a run (bad magic, implausible length, truncation, checksum mismatch, blocks out of order), the manifest, or (with `durability`) the write-ahead log before its last record. | Not retryable; the bytes on disk are damaged. Nothing was deleted. |
+| `InvalidInput` | The caller passed something the format cannot store: a key or value over 1 GiB, keys out of order in a [`RunWriter`](#runwriter), or a batch whose log record would pass 2 GiB (with `durability`). Nothing was written. Also a directory that `open` will not use (see [`Lsm::open`](#lsmopen)). *(since 1.1)* | Fix the input and retry. |
 
 `Error` implements `core::error::Error` (the same trait as `std::error::Error`)
 and `Display`. With `std` it also implements
@@ -801,15 +909,16 @@ impl<'a> RunReader<'a> {
 ```
 
 A validated run held in memory. `new` checks the header and footer magic, the
-index extent, the index checksum, and every index entry (order and block
-extents), returning `Error::Corruption` on any failure. `get` reads, verifies,
+index extent, the index checksum, every index entry (order and block
+extents), the footer checksum (runs written since 1.4), and that the footer's
+entry count fits the blocks, returning `Error::Corruption` on any failure. `get` reads, verifies,
 and scans the one block that could hold the key. `iter` (also `&RunReader:
 IntoIterator`) yields `Result<(&'a [u8], Entry<'a>)>` in key order, verifying
 each block's checksum as it reaches it, and also checks that keys keep
 increasing across blocks and that each block ends with the key the index
 records; it yields the first error and then ends. Keys and values borrow from
-the buffer; nothing is copied. `entry_count` is the footer's informational
-count.
+the buffer; nothing is copied. `entry_count` is the footer's count, checked
+by `new` to fit the run's blocks.
 
 ```rust
 use lsm_db::format::{RunReader, RunWriter};
@@ -846,9 +955,10 @@ two apart. `Copy`, `Eq`, `Hash`, and `Debug`.
 pub fn crc32c(data: &[u8]) -> u32
 ```
 
-The CRC32C (Castagnoli) checksum the format uses. With `std` it runs on the
-`crc32c` crate, which picks the SSE4.2 or ARMv8 CRC instructions at run time.
-Without `std` it uses those instructions when the target enables them at compile
+The CRC32C (Castagnoli) checksum the format uses, computed in the crate. With
+`std` it picks the SSE4.2 or ARMv8 CRC instructions at run time (since 1.2;
+before that it ran on the `crc32c` crate). Without `std` it uses those
+instructions when the target enables them at compile
 time (`-C target-feature=+sse4.2` on x86_64, `+crc` on aarch64), and
 slicing-by-8 tables otherwise. Every path returns the same value.
 
@@ -873,11 +983,17 @@ The longest key and value the format stores (1 GiB each). `Lsm::put`,
 
 `Lsm` is `Send + Sync` and every method takes `&self`, so one engine can be
 wrapped in an [`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) and
-used from many threads. Reads proceed in parallel; writes are serialized;
-[`scan`](#lsmscan) returns a consistent snapshot and never blocks writers for
-the duration of iteration. A background thread compacts runs as they accumulate;
+used from many threads. Reads proceed in parallel with each other; writes are
+serialized; [`scan`](#lsmscan) returns a consistent snapshot and never blocks
+writers for the duration of iteration. A flush holds the engine's write lock
+while it writes the memtable as a run, so every read and write waits for it,
+for a time that grows with the memtable's size, and with `durability` every
+write holds the lock across its `fsync`. Moving the flush off the lock
+(an immutable memtable that reads still consult) is planned. A background
+thread compacts runs as they accumulate;
 its expensive merge runs with no lock held, taking the engine lock only to swap
-the finished run in, so it does not block reads or writes for the merge. Dropping
+the finished run in and write the manifest, so it does not block reads or
+writes for the merge. Dropping
 the `Lsm` stops and joins that thread, then flushes the buffer (since 1.2.1;
 before that a drop discarded unflushed writes in a build without
 `durability`). A flush error at drop cannot be reported; call
@@ -923,13 +1039,14 @@ byte-level format is frozen for 1.x and specified in
 
 ### Crash-safe writes (`durability` feature)
 
-By default, writes are durable once flushed; a write still buffered in the
-memtable when the process exits is lost. Enable the `durability` feature to close
-that gap:
+By default, writes are durable once flushed. Dropping or closing the handle
+flushes (since 1.2.1), so a clean exit keeps every write; a write still
+buffered when the process is killed or the machine loses power is lost. Enable
+the `durability` feature to close that gap:
 
 ```toml
 [dependencies]
-lsm-db = { version = "1.3", features = ["durability"] }
+lsm-db = { version = "1.4", features = ["durability"] }
 ```
 
 With it on, every `put` / `delete` / `write` is appended to a `wal-db`
@@ -938,7 +1055,20 @@ logged as one atomic record. On open, the log is replayed into the memtable and
 checkpointed to a run, so no acknowledged write is lost across a crash — even one
 before the next flush. The log holds only the writes since the last flush; a
 flush empties it. The public API is identical either way, so the same code runs
-durably or not depending on the feature:
+durably or not depending on the feature.
+
+Since 1.4 the log is opened with wal-db's strict policy: a damaged final record
+(a write a crash cut short, never acknowledged) is cut, but damage with intact
+records after it refuses the open with `Error::Corruption` and leaves the log as
+it is, because cutting there would drop acknowledged writes. A single write's
+record can be as large as the format allows (two 1 GiB fields); a batch whose
+record would pass that is refused with `Error::InvalidInput`.
+
+Cargo unifies features, so a dependency can turn `durability` on or off without
+the application's code changing. A build without the feature refuses a
+directory whose `wal.log` is not empty (since 1.4); before, it ignored the log,
+and the next durable open replayed its old writes over the data written in
+between.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -968,7 +1098,7 @@ block:
 
 ```toml
 [dependencies]
-lsm-db = { version = "1.3", features = ["bloom"] }
+lsm-db = { version = "1.4", features = ["bloom"] }
 ```
 
 The win is on negative lookups across many runs: in a benchmark of misses over
@@ -982,6 +1112,14 @@ embedded in the run — it lives in a **sidecar** file (`<run>.sst.bloom`) writt
 when the run is created and loaded when it is reopened. A sidecar is a pure
 acceleration hint: if it is missing or unreadable, the run is consulted directly
 with identical results.
+
+A sidecar's CRC32C detects damage; it is not authentication, since anyone who
+can write the file can compute it. Since 1.4 the decoded filter's shape is
+checked too (bit count, word count, and hash count agree and are in range), so a
+crafted sidecar cannot make a lookup panic or hash without bound. A well-formed
+filter built over other keys can still make point reads miss keys the run holds
+(scans are not affected). Keep the database directory writable only by its
+owner.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1020,9 +1158,9 @@ the [`format`](#format) codec does not.
 ```toml
 [dependencies]
 # Run codec, needs a global allocator.
-lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
+lsm-db = { version = "1.4", default-features = false, features = ["alloc"] }
 # Or only crc32c, Entry, the limits, and Error, with no allocator at all.
-lsm-db = { version = "1.3", default-features = false }
+lsm-db = { version = "1.4", default-features = false }
 ```
 
 The checksum is part of the format, so it is identical in every build. Without

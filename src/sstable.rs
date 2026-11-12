@@ -18,6 +18,8 @@
 //! │ data block 1         │  each block holds a sorted run of entries (~4 KiB)
 //! │ …                    │
 //! ├──────────────────────┤
+//! │ footer check (12)    │  "LSMFCK01" · crc u32 of the footer (since 1.4)
+//! ├──────────────────────┤
 //! │ index block          │  one record per data block:
 //! │                      │    last_key_len u32 · last_key · offset u64 · len u32 · crc u32
 //! ├──────────────────────┤
@@ -28,8 +30,10 @@
 //!
 //! Every data block carries a CRC32C in the index, so a block is integrity
 //! checked when it is read; the index block carries its own CRC32C in the
-//! footer. Opening a run reads only the footer and index — values stay on disk
-//! and are read one block at a time, with a single positioned read (`pread` on
+//! footer, and the footer its own in the footer check (runs written before
+//! 1.4 have none, and their footer's entry count is checked against the
+//! blocks instead). Opening a run reads only the header, footer, and index:
+//! values stay on disk and are read one block at a time, with a single positioned read (`pread` on
 //! Unix, `seek_read` on Windows) so concurrent readers share one file handle.
 
 use std::fs::{File, OpenOptions};
@@ -44,7 +48,8 @@ use crate::cache::{BlockCache, BlockKey, DecodedBlock};
 use crate::crc::crc32c;
 use crate::error::{Error, Result};
 use crate::format::{
-    self, BlockEntries, FOOTER_LEN, Footer, IndexEntries, MAGIC, TARGET_BLOCK_SIZE,
+    self, BlockEntries, FOOTER_CHECK_LEN, FOOTER_LEN, Footer, IndexEntries, MAGIC,
+    TARGET_BLOCK_SIZE,
 };
 use crate::record::Record;
 
@@ -102,8 +107,9 @@ pub(crate) struct SsTable {
     file: File,
     path: PathBuf,
     index: Vec<BlockHandle>,
-    /// Number of entries (values + tombstones), read from the footer. Used to
-    /// size the bloom filter built during compaction.
+    /// Number of entries (values + tombstones), read from the footer and
+    /// checked against the blocks' size at open. Used to size the bloom
+    /// filter built during compaction.
     entry_count: u64,
     /// Optional per-run bloom filter, attached after open; lets a point read
     /// skip this run when the key is definitely absent.
@@ -119,8 +125,9 @@ pub(crate) struct SsTable {
 impl SsTable {
     /// Open the run at `path`, reading and validating its footer and index.
     ///
-    /// Returns [`Error::Corruption`] if the magic is wrong, the footer or index
-    /// is inconsistent, or the index checksum does not match.
+    /// Returns [`Error::Corruption`] if either magic is wrong, the footer or
+    /// index is inconsistent, the index or footer checksum does not match, or
+    /// the footer's entry count does not fit the blocks.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::io("open sorted run", e))?;
         let file_len = file
@@ -132,26 +139,39 @@ impl SsTable {
             return Err(Error::corruption("file shorter than header and footer"));
         }
 
-        // Footer, read from the end.
-        let mut footer = [0u8; FOOTER_LEN];
-        pread_exact(&file, &mut footer, file_len - FOOTER_SIZE)
-            .map_err(|e| Error::io("read run footer", e))?;
-        let Footer {
-            entry_count,
-            index_offset,
-            index_len,
-            index_crc,
-        } = Footer::parse(&footer, file_len)?;
+        let mut header = [0u8; MAGIC.len()];
+        pread_exact(&file, &mut header, 0).map_err(|e| Error::io("read run header", e))?;
+        if &header != MAGIC {
+            return Err(Error::corruption("bad magic; not an lsm-db sorted run"));
+        }
 
-        // Index block.
-        let mut index_bytes = vec![0u8; usize_of(index_len)?];
-        pread_exact(&file, &mut index_bytes, index_offset)
-            .map_err(|e| Error::io("read run index", e))?;
-        if crc32c(&index_bytes) != index_crc {
+        // Footer, read from the end.
+        let mut footer_bytes = [0u8; FOOTER_LEN];
+        pread_exact(&file, &mut footer_bytes, file_len - FOOTER_SIZE)
+            .map_err(|e| Error::io("read run footer", e))?;
+        let footer = Footer::parse(&footer_bytes, file_len)?;
+
+        // Index block, with the bytes before it that hold the footer check
+        // when the run has one: one read.
+        let lead = footer
+            .index_offset
+            .saturating_sub(MAGIC.len() as u64)
+            .min(FOOTER_CHECK_LEN as u64);
+        let read_from = footer.index_offset - lead;
+        let mut bytes = vec![0u8; usize_of(footer.index_len + lead)?];
+        pread_exact(&file, &mut bytes, read_from).map_err(|e| Error::io("read run index", e))?;
+        let (before_index, index_bytes) = bytes.split_at(usize_of(lead)?);
+        if crc32c(index_bytes) != footer.index_crc {
             return Err(Error::corruption("index checksum mismatch"));
         }
 
-        let index = parse_index(&index_bytes, index_offset)?;
+        let index = parse_index(index_bytes, footer.index_offset)?;
+        footer.verify(
+            &footer_bytes,
+            index.iter().map(|h| (h.offset, h.len)),
+            before_index,
+        )?;
+        let entry_count = footer.entry_count;
         Ok(SsTable {
             file,
             path: path.to_path_buf(),
@@ -235,7 +255,7 @@ impl SsTable {
                 return Ok(block);
             }
             let block = Arc::new(self.decode_block_at(i)?);
-            cache.insert(key, Arc::clone(&block));
+            cache.insert(key, Arc::clone(&block), crate::cache::charge_of(&block));
             return Ok(block);
         }
         Ok(Arc::new(self.decode_block_at(i)?))
@@ -288,8 +308,10 @@ impl Drop for SsTable {
         if self.obsolete.load(Ordering::Acquire) {
             // Best effort: the run is already out of the live set, so a failed
             // unlink only leaves a file that the next open will reclaim as an
-            // orphan. Closing the handle first keeps this valid on Windows. The
-            // bloom sidecar is removed alongside the run it describes.
+            // orphan. The handle is still open here (`file` drops after this
+            // runs); the removal works on Windows because the standard library
+            // opens files with delete sharing. The bloom sidecar is removed
+            // alongside the run it describes.
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_file(bloom::sidecar_path(&self.path));
         }
@@ -334,7 +356,11 @@ impl<'a> RunCursor<'a> {
             if self.next_block >= self.table.index.len() {
                 return; // exhausted
             }
-            match self.table.read_block(self.next_block) {
+            match self
+                .table
+                .read_block(self.next_block)
+                .and_then(|entries| self.check_block(entries))
+            {
                 Ok(entries) => {
                     self.next_block += 1;
                     self.block = entries.into_iter();
@@ -345,6 +371,33 @@ impl<'a> RunCursor<'a> {
                 }
             }
         }
+    }
+
+    /// Check that the block about to be read keeps the run in order: its
+    /// last key is the one the index records for it, and its first key is
+    /// above the previous block's. The block's own decode checked the order
+    /// inside it. A merge relies on every source being in order; without
+    /// this a run whose blocks overlap (each with a valid checksum) would
+    /// make it emit keys out of order.
+    fn check_block(&self, entries: DecodedBlock) -> Result<DecodedBlock> {
+        let i = self.next_block;
+        let last = entries.last().map(|(k, _)| k.as_slice());
+        if last != Some(self.table.index[i].last_key.as_slice()) {
+            return Err(Error::corruption(
+                "block's last key does not match the index",
+            ));
+        }
+        if let (Some(prev), Some((first, _))) = (
+            i.checked_sub(1).map(|p| &self.table.index[p].last_key),
+            entries.first(),
+        ) {
+            if first <= prev {
+                return Err(Error::corruption(
+                    "keys not strictly increasing across blocks",
+                ));
+            }
+        }
+        Ok(entries)
     }
 
     /// The key of the next entry, or `None` if exhausted or errored.
@@ -372,7 +425,7 @@ impl<'a> RunCursor<'a> {
 }
 
 /// Streaming writer for a sorted run. Entries must be supplied in strictly
-/// ascending key order; the merge that feeds it guarantees that.
+/// ascending key order; [`push`](SsTableWriter::push) refuses any other.
 pub(crate) struct SsTableWriter {
     out: BufWriter<File>,
     offset: u64,
@@ -406,11 +459,22 @@ impl SsTableWriter {
     }
 
     /// Append one entry. Keys must arrive in strictly ascending order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] when `key` is not above the previous key: the
+    /// source feeding the writer (a merge of runs) is out of order, and the
+    /// run would fail its own checks when read.
     pub(crate) fn push(&mut self, key: &[u8], record: &Record) -> Result<()> {
         // The engine's write methods already enforce these limits; checking
         // again here guarantees a run is never written that a reader rejects.
         let entry = record.as_entry();
         format::check_lengths(key, entry)?;
+        if self.entry_count > 0 && key <= self.block_last_key.as_slice() {
+            return Err(Error::corruption(
+                "a run was given keys out of order to write",
+            ));
+        }
         format::encode_entry(&mut self.block_buf, key, entry);
         self.block_last_key.clear();
         self.block_last_key.extend_from_slice(key);
@@ -434,7 +498,8 @@ impl SsTableWriter {
             .write_all(&self.block_buf)
             .map_err(|e| Error::io("write data block", e))?;
         self.index.push(BlockHandle {
-            last_key: std::mem::take(&mut self.block_last_key),
+            // Kept in `block_last_key` too: the next push compares with it.
+            last_key: self.block_last_key.clone(),
             offset: self.offset,
             len,
             crc,
@@ -444,11 +509,12 @@ impl SsTableWriter {
         Ok(())
     }
 
-    /// Flush the final block, write the index and footer, and `fsync`.
+    /// Flush the final block, write the footer check, the index, and the
+    /// footer, and `fsync`.
     pub(crate) fn finish(mut self) -> Result<()> {
         self.flush_block()?;
 
-        let index_offset = self.offset;
+        let index_offset = self.offset + FOOTER_CHECK_LEN as u64;
         let mut index_bytes = Vec::new();
         for handle in &self.index {
             format::encode_index_entry(
@@ -461,11 +527,14 @@ impl SsTableWriter {
         }
         let index_crc = crc32c(&index_bytes);
         let index_len = index_bytes.len() as u64;
+        let footer = format::encode_footer(self.entry_count, index_offset, index_len, index_crc);
+        self.out
+            .write_all(&format::encode_footer_check(&footer))
+            .map_err(|e| Error::io("write run footer check", e))?;
         self.out
             .write_all(&index_bytes)
             .map_err(|e| Error::io("write run index", e))?;
 
-        let footer = format::encode_footer(self.entry_count, index_offset, index_len, index_crc);
         self.out
             .write_all(&footer)
             .map_err(|e| Error::io("write run footer", e))?;
