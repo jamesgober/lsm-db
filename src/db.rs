@@ -101,8 +101,8 @@ struct Engine {
 ///
 /// Flushed runs are `fsync`ed and recorded in a manifest, so flushed data
 /// survives reopening and a crash mid-flush or mid-compaction recovers to a
-/// consistent run set. Dropping the handle flushes the in-memory buffer, so a
-/// clean exit keeps every write. A crash (the
+/// consistent run set. Dropping the handle, or [`close`](Lsm::close), flushes
+/// the in-memory buffer, so a clean exit keeps every write. A crash (the
 /// process killed, the machine losing power) before a flush loses the writes
 /// still buffered, unless the `durability` feature is on: it logs each write
 /// before acknowledging it and replays the log on open. Call
@@ -171,7 +171,23 @@ impl Lsm {
         let manifest = Manifest::load(&dir)?;
         let (run_names, manifest_seq) = match manifest {
             Some(m) => (m.runs, m.next_seq),
-            None => (Vec::new(), 0),
+            None => {
+                // Every store writes its manifest when it is created, so run
+                // files without one mean the manifest was lost: deleting the
+                // runs as orphans would lose their data. Refuse instead.
+                for entry in
+                    fs::read_dir(&dir).map_err(|e| Error::io("scan database directory", e))?
+                {
+                    let entry = entry.map_err(|e| Error::io("read directory entry", e))?;
+                    if manifest::seq_of(&entry.file_name().to_string_lossy()).is_some() {
+                        return Err(Error::corruption(
+                            "MANIFEST is missing but run files exist; restore it from a backup",
+                        ));
+                    }
+                }
+                Manifest::store(&dir, 0, &[])?;
+                (Vec::new(), 0)
+            }
         };
         let live: HashSet<&str> = run_names.iter().map(String::as_str).collect();
 
@@ -197,24 +213,31 @@ impl Lsm {
         // Reclaim orphans (temporaries and runs no longer in the manifest) and
         // make sure the next sequence number is past every file on disk.
         let mut next_seq = manifest_seq;
+        let mut removed = false;
         for entry in fs::read_dir(&dir).map_err(|e| Error::io("scan database directory", e))? {
             let entry = entry.map_err(|e| Error::io("read directory entry", e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".tmp") {
                 fs::remove_file(entry.path()).map_err(|e| Error::io("remove temporary file", e))?;
+                removed = true;
             } else if let Some(run) = name.strip_suffix(".bloom") {
                 // A bloom sidecar whose run is not live is an orphan (e.g. from a
                 // compaction that crashed before its manifest commit).
                 if !live.contains(run) {
                     fs::remove_file(entry.path())
                         .map_err(|e| Error::io("remove orphan bloom sidecar", e))?;
+                    removed = true;
                 }
             } else if let Some(seq) = manifest::seq_of(&name) {
                 next_seq = next_seq.max(seq + 1);
                 if !live.contains(name.as_str()) {
                     fs::remove_file(entry.path()).map_err(|e| Error::io("remove orphan run", e))?;
+                    removed = true;
                 }
             }
+        }
+        if removed {
+            crate::fault::sync_dir(&dir)?;
         }
 
         // Open the write-ahead log and replay any writes not yet flushed into a
@@ -417,6 +440,64 @@ impl Lsm {
         self.engine.flush()
     }
 
+    /// Every key that starts with `prefix`, with its value, in ascending key
+    /// order: the scan of `prefix..` up to the first key that does not start
+    /// with it. A prefix of only `0xFF` bytes (or an empty one) has no upper
+    /// key, so its scan runs to the end of the key space.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// db.put(b"user:1", b"ann")?;
+    /// db.put(b"user:2", b"bo")?;
+    /// db.put(b"users", b"not a user key")?;
+    /// let users: Vec<_> = db.scan_prefix(b"user:")?.map(|(k, _)| k).collect();
+    /// assert_eq!(users, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`scan`](Self::scan).
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Scan> {
+        self.engine
+            .scan((Bound::Included(prefix.to_vec()), prefix_end(prefix)))
+    }
+
+    /// Close the database: stop the background compactor and flush the
+    /// in-memory buffer, returning any error the flush hits.
+    ///
+    /// Dropping the handle does the same, but has nowhere to report an
+    /// error, so call `close` when the caller can act on one (a full disk,
+    /// a failed sync). After `close` returns `Ok`, every write is in a run
+    /// on disk and is read back on reopen.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = tempfile::tempdir()?;
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// db.put(b"k", b"v")?;
+    /// db.close()?;
+    ///
+    /// let db = lsm_db::Lsm::open(dir.path())?;
+    /// assert_eq!(db.get(b"k")?, Some(b"v".to_vec()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`flush`](Self::flush).
+    pub fn close(mut self) -> Result<()> {
+        self.shut_down()
+    }
+
     /// Stop the compactor, then flush the buffer. Safe to call twice: the
     /// second call finds no compactor and an empty buffer.
     fn shut_down(&mut self) -> Result<()> {
@@ -469,8 +550,7 @@ impl Lsm {
 
 /// Dropping the handle stops the compactor and flushes the buffer, so a
 /// write is not lost because nobody called [`Lsm::flush`]. An error from
-/// that flush cannot be reported here; call [`Lsm::flush`] before the drop to
-/// see it.
+/// that flush cannot be reported here; [`Lsm::close`] returns it.
 impl Drop for Lsm {
     fn drop(&mut self) {
         let _ = self.shut_down();
@@ -553,18 +633,21 @@ impl Engine {
     where
         R: RangeBounds<Vec<u8>>,
     {
+        let start = range.start_bound().map(Vec::as_slice);
+        let end = range.end_bound().map(Vec::as_slice);
         let (mem, runs) = {
             let inner = self.read_guard();
             let mem: Vec<(Vec<u8>, Record)> = inner
                 .memtable
-                .iter()
-                .filter(|(k, _)| matches!(position(&range, k), Pos::In))
+                .range(start, end)
                 .map(|(k, r)| (k.clone(), r.clone()))
                 .collect();
             (mem, inner.runs.clone())
         };
 
-        let cursors = runs.iter().map(|r| r.cursor()).collect();
+        // Each run starts at the block that can hold the range's start, so
+        // a scan costs its range, not every key before it.
+        let cursors = runs.iter().map(|r| r.cursor_from(start)).collect();
         let mut out = Vec::new();
         for item in Merge::new(mem, cursors) {
             let (key, value) = item?;
@@ -597,39 +680,38 @@ impl Engine {
 
     /// Write the memtable to a new run and install it, newest first.
     fn flush_locked(&self, inner: &mut Inner) -> Result<()> {
-        let entries = inner.memtable.take();
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let name = manifest::run_filename(seq);
         let tmp = self.dir.join(format!("{name}.tmp"));
         let final_path = self.dir.join(&name);
 
-        let mut writer = SsTableWriter::create(&tmp)?;
-        let mut filter = bloom::builder(entries.len());
-        for (key, record) in &entries {
-            writer.push(key, record)?;
-            filter.add(key);
-        }
-        writer.finish()?;
-        fs::rename(&tmp, &final_path).map_err(|e| Error::io("install flushed run", e))?;
-
-        // Write the bloom sidecar before the manifest commit, so any run the
-        // manifest names is guaranteed to have its sidecar on disk.
-        let filter = filter.finish();
-        if let Some(filter) = &filter {
-            filter.write_sidecar(&final_path)?;
-        }
-        let mut table = SsTable::open(&final_path)?;
-        table.attach_filter(filter);
-        table.attach_cache(Arc::clone(&self.cache));
-
-        let run = Arc::new(table);
-        let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
-        new_runs.push(run);
-        new_runs.extend(inner.runs.iter().cloned());
-
-        let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
-        Manifest::store(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
+        // The memtable stays as it is until the manifest names the new run:
+        // a flush that fails anywhere before leaves every write readable,
+        // and the next flush tries again.
+        let installed = self
+            .write_run(&inner.memtable, &tmp, &final_path)
+            .and_then(|table| {
+                let run = Arc::new(table);
+                let mut new_runs = Vec::with_capacity(inner.runs.len() + 1);
+                new_runs.push(run);
+                new_runs.extend(inner.runs.iter().cloned());
+                let names: Vec<String> = new_runs.iter().map(|r| r.file_name()).collect();
+                Manifest::store(&self.dir, self.next_seq.load(Ordering::SeqCst), &names)?;
+                Ok(new_runs)
+            });
+        let new_runs = match installed {
+            Ok(new_runs) => new_runs,
+            Err(err) => {
+                // Best effort: the files are orphans the next open would
+                // remove anyway.
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::remove_file(&final_path);
+                let _ = fs::remove_file(bloom::sidecar_path(&final_path));
+                return Err(err);
+            }
+        };
         inner.runs = new_runs;
+        let _ = inner.memtable.take();
 
         // The flushed writes are now durable in the run, so the log that held
         // them can be emptied; recovery replays only writes since this flush.
@@ -639,6 +721,36 @@ impl Engine {
             self.signal_compaction();
         }
         Ok(())
+    }
+
+    /// Write `memtable` as the run at `final_path` (through `tmp`), with its
+    /// bloom sidecar, and open it: everything a flush does before the
+    /// manifest commit.
+    fn write_run(&self, memtable: &MemTable, tmp: &Path, final_path: &Path) -> Result<SsTable> {
+        let mut writer = SsTableWriter::create(tmp)?;
+        let mut filter = bloom::builder(memtable.len());
+        for (key, record) in memtable.iter() {
+            writer.push(key, record)?;
+            filter.add(key);
+        }
+        crate::fault::check("write flushed run")?;
+        writer.finish()?;
+        crate::fault::check("install flushed run")?;
+        fs::rename(tmp, final_path).map_err(|e| Error::io("install flushed run", e))?;
+
+        // Write the bloom sidecar before the manifest commit, so any run the
+        // manifest names is guaranteed to have its sidecar on disk.
+        let filter = filter.finish();
+        if let Some(filter) = &filter {
+            filter.write_sidecar(final_path)?;
+        }
+        // The run's name (and its sidecar's) must be durable before the
+        // manifest names it.
+        crate::fault::sync_dir(&self.dir)?;
+        let mut table = SsTable::open(final_path)?;
+        table.attach_filter(filter);
+        table.attach_cache(Arc::clone(&self.cache));
+        Ok(table)
     }
 
     /// Merge every current run into a single new run, then swap it in.
@@ -698,6 +810,7 @@ impl Engine {
         if let Some(filter) = &filter {
             filter.write_sidecar(&final_path)?;
         }
+        crate::fault::sync_dir(&self.dir)?;
         let mut output = SsTable::open(&final_path)?;
         output.attach_filter(filter);
         output.attach_cache(Arc::clone(&self.cache));
@@ -781,6 +894,21 @@ enum Pos {
     Above,
 }
 
+/// The exclusive end of the keys that start with `prefix`: the prefix with
+/// its last byte below `0xFF` raised by one and the bytes after it dropped.
+/// A prefix of only `0xFF` bytes, or an empty one, has no such key: every key
+/// after it starts with it, so the end is unbounded.
+fn prefix_end(prefix: &[u8]) -> Bound<Vec<u8>> {
+    match prefix.iter().rposition(|&b| b < u8::MAX) {
+        Some(last) => {
+            let mut end = prefix[..=last].to_vec();
+            end[last] += 1;
+            Bound::Excluded(end)
+        }
+        None => Bound::Unbounded,
+    }
+}
+
 /// Classify `key` against `range`.
 fn position<R: RangeBounds<Vec<u8>>>(range: &R, key: &[u8]) -> Pos {
     let below = match range.start_bound() {
@@ -816,6 +944,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Lsm::open(dir.path()).unwrap();
         (dir, db)
+    }
+
+    /// Every step of a flush before the manifest commit, failed once: the
+    /// flush returns the error, every write stays readable from the live
+    /// handle, the next flush succeeds, and a reopen finds the data. Each
+    /// point is armed on this thread only, so the failure is deterministic.
+    #[test]
+    fn test_a_failed_flush_keeps_the_memtable() {
+        for point in [
+            "write flushed run",
+            "install flushed run",
+            "sync directory",
+            "install manifest",
+        ] {
+            let (dir, db) = db_no_autocompact();
+            db.put(b"before", b"1").unwrap();
+            db.flush().unwrap();
+            db.put(b"a", b"2").unwrap();
+            db.delete(b"before").unwrap();
+            crate::fault::arm(point);
+            assert!(db.flush().is_err(), "{point}: the flush should fail");
+            assert_eq!(db.get(b"a").unwrap(), Some(b"2".to_vec()), "{point}");
+            assert_eq!(db.get(b"before").unwrap(), None, "{point}");
+            assert_eq!(db.run_count(), 1, "{point}: no run installed");
+            // No file left that a later open would read as a run.
+            let leftovers: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp") || manifest::seq_of(n) == Some(1))
+                .collect();
+            assert!(leftovers.is_empty(), "{point}: {leftovers:?}");
+            db.flush().unwrap();
+            assert_eq!(db.run_count(), 2);
+            drop(db);
+            let db = Lsm::open(dir.path()).unwrap();
+            assert_eq!(db.get(b"a").unwrap(), Some(b"2".to_vec()), "{point}");
+            assert_eq!(db.get(b"before").unwrap(), None, "{point}");
+        }
+    }
+
+    /// The directory is synced after a flush installs its run and again
+    /// after the manifest names it, and after orphans are removed at open
+    /// (a no-op sync on Windows, counted all the same).
+    #[test]
+    fn test_flushes_and_opens_sync_the_directory() {
+        let (dir, db) = db_no_autocompact();
+        db.put(b"k", b"v").unwrap();
+        let before = crate::fault::dir_syncs();
+        db.flush().unwrap();
+        assert_eq!(crate::fault::dir_syncs() - before, 2);
+        drop(db);
+        fs::write(dir.path().join("run-0000000099.sst.tmp"), b"half a run").unwrap();
+        let before = crate::fault::dir_syncs();
+        let _db = Lsm::open(dir.path()).unwrap();
+        assert!(crate::fault::dir_syncs() > before);
+        assert!(!dir.path().join("run-0000000099.sst.tmp").exists());
+    }
+
+    /// A store writes its manifest when it is created; afterwards run files
+    /// without a manifest refuse to open and are left as they are.
+    #[test]
+    fn test_a_missing_manifest_with_runs_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Lsm::open(dir.path()).unwrap());
+        assert!(dir.path().join("MANIFEST").exists());
+        let db = Lsm::open(dir.path()).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        drop(db);
+        fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+        let runs = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    manifest::seq_of(&e.as_ref().unwrap().file_name().to_string_lossy()).is_some()
+                })
+                .count()
+        };
+        assert_eq!(runs(), 1);
+        assert!(matches!(
+            Lsm::open(dir.path()),
+            Err(Error::Corruption { .. })
+        ));
+        assert_eq!(runs(), 1, "the run must not be deleted");
     }
 
     #[test]

@@ -18,6 +18,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.3.0] - 2026-11-11
+
+Range scans cost their range, not their position in the key space; `close`
+and `scan_prefix`; three durability fixes from issue #3. The on-disk format
+and every checksum are unchanged.
+
+### Added
+
+- `Lsm::close(self)`: stops the compactor and flushes, returning the flush error that `Drop` cannot report.
+- `Lsm::scan_prefix(prefix)`: every key that starts with `prefix`. A prefix made only of `0xFF` bytes (or an empty one) scans to the end of the key space.
+- Benchmark `scan_range`: 100-key range scans over 100,000 keys in 8 runs, and over 50,000 keys in the memtable.
+
+### Changed
+
+- A range scan seeks to its start key: the memtable through `BTreeMap::range`, and each run from the first block whose last key reaches the start (found in the block index), instead of reading every key before the range. A scan now costs its range, not its position in the key space. Results are unchanged: a test compares 2,000 random ranges of every bound kind (including empty and inverted ones) with a model, over five runs and the memtable. Measured on Windows, x86_64, alternating with 1.2.1, three rounds: 100 keys at the end of 100,000 keys in 8 runs took 296 to 563 us, against 42 to 70 ms; at the end of a 50,000-key memtable, 18 to 44 us against 397 to 519 us; at the start of the key space, unchanged (154 to 468 us against 160 to 328 us).
+
+### Fixed
+
+- **A failed flush lost the memtable** (#3, item 2): `flush` took the buffer before writing the run, so on an error the writes were gone from the live handle. The buffer now stays until the manifest names the new run; a failed flush returns its error, every write stays readable, the files it made are removed, and the next flush tries again.
+- **No directory sync** (#3, item 3): on Unix the directory is now synced after a flush or compaction installs its run and sidecar, after every manifest install, and after open removes orphans, so those names survive a power loss. Windows needs no directory sync for this.
+- **A missing manifest deleted every run** (#3, part of item 1): a store now writes its manifest when it is created, and open refuses (`Error::Corruption`) run files without a manifest instead of removing them as orphans. A checksum over the manifest changes its format, so it waits for 2.0.
+- Fault-injection tests drive each step of a flush (writing the run, installing it, syncing the directory, installing the manifest) through a failure, and check the directory syncs and the missing-manifest refusal.
+
+---
+
 ## [1.2.1] - 2026-11-11
 
 A drop no longer loses unflushed writes. The on-disk format and every
@@ -484,7 +509,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jamesgober/lsm-db/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/lsm-db/compare/v1.0.0...v1.1.0

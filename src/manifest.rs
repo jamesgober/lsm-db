@@ -90,8 +90,15 @@ impl Manifest {
             file.sync_all()
                 .map_err(|e| Error::io("flush manifest to stable storage", e))?;
         }
-        fs::rename(&tmp, &final_path).map_err(|e| Error::io("install manifest", e))?;
-        Ok(())
+        let installed = crate::fault::check("install manifest").and_then(|()| {
+            fs::rename(&tmp, &final_path).map_err(|e| Error::io("install manifest", e))
+        });
+        if let Err(err) = installed {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        // The rename is durable only once the directory is.
+        crate::fault::sync_dir(dir)
     }
 }
 

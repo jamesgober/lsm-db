@@ -34,6 +34,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -264,6 +265,21 @@ impl SsTable {
     /// A cursor over every entry in the run, in ascending key order.
     pub(crate) fn cursor(&self) -> RunCursor<'_> {
         RunCursor::new(self)
+    }
+
+    /// A cursor that starts at the first block that can hold a key at or
+    /// after `start`, found in the block index without reading a block. The
+    /// entries of that block below `start` still come out first; the caller
+    /// skips them.
+    pub(crate) fn cursor_from(&self, start: Bound<&[u8]>) -> RunCursor<'_> {
+        let mut cursor = RunCursor::new(self);
+        cursor.next_block = match start {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                self.index.partition_point(|h| h.last_key.as_slice() < key)
+            }
+            Bound::Unbounded => 0,
+        };
+        cursor
     }
 }
 

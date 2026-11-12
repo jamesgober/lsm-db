@@ -90,7 +90,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lsm-db = { version = "1.1", default-features = false, features = ["alloc"] }
+//! lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
 //! ```
 //!
 //! CRC32C is part of the format, so every build computes identical checksums.
@@ -164,6 +164,8 @@ mod db;
 #[cfg(feature = "std")]
 mod durability;
 mod error;
+#[cfg(feature = "std")]
+mod fault;
 pub mod format;
 #[cfg(feature = "std")]
 mod manifest;

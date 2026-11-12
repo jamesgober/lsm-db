@@ -62,10 +62,10 @@
 
 ```toml
 [dependencies]
-lsm-db = "1.2"
+lsm-db = "1.3"
 
 # Crash-safe writes (write-ahead log) and/or bloom-filtered point reads:
-lsm-db = { version = "1.2", features = ["durability", "bloom"] }
+lsm-db = { version = "1.3", features = ["durability", "bloom"] }
 ```
 
 ### `no_std`
@@ -73,7 +73,7 @@ lsm-db = { version = "1.2", features = ["durability", "bloom"] }
 The engine needs a filesystem, so it stays behind the default `std` feature. With `default-features = false` the crate builds on bare-metal targets and provides the run format as an in-memory codec: `format::RunWriter` and `format::RunReader` with the `alloc` feature, and `format::crc32c` and the error type without it. A run built on a device reads on a host and the other way round.
 
 ```toml
-lsm-db = { version = "1.2", default-features = false, features = ["alloc"] }
+lsm-db = { version = "1.3", default-features = false, features = ["alloc"] }
 ```
 
 CRC32C is computed identically in every build. Without `std` it uses the SSE4.2 or ARMv8 CRC instructions when the target enables them at compile time (`-C target-feature=+sse4.2` / `+crc`) and a slicing-by-8 table otherwise. See [`docs/API.md`](./docs/API.md#no_std).
@@ -106,9 +106,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} = {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
     }
 
-    // Force the buffer to disk now. Dropping `db` does the same, so a clean
-    // exit keeps every write; `flush` is where a disk error is reported.
-    db.flush()?;
+    // Every key with a prefix.
+    let users: Vec<_> = db.scan_prefix(b"user:")?.collect();
+    assert_eq!(users.len(), 2);
+
+    // Flush and stop. Dropping `db` does the same, so a clean exit keeps
+    // every write; `close` is where a disk error is reported.
+    db.close()?;
     Ok(())
 }
 ```
@@ -119,7 +123,7 @@ Tuning lives behind [`LsmConfig`](./docs/API.md#lsmconfig); grouped writes behin
 
 ## Status
 
-This is <code>v1.2.1</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
+This is <code>v1.3.0</code>. The **public API is frozen until 2.0** and the on-disk format is **frozen for the 1.x series**; 1.1 added real <code>no_std</code> support through the <code>format</code> run codec, and 1.2 brings no third-party crate into a default build; 1.3 makes a range scan cost its range. The engine is feature-complete, hardened against hostile input, and soak-tested single- and multi-threaded: multiple on-disk runs, background compaction, crash recovery, crash-safe writes (<code>durability</code>), bloom-filtered point reads (<code>bloom</code>), and a block cache, behind the Tier-1 API (<code>open</code>/<code>put</code>/<code>get</code>/<code>delete</code>/<code>scan</code>). See <a href="./docs/API.md"><code>docs/API.md</code></a> and <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>.
 
 <hr>
 <br>

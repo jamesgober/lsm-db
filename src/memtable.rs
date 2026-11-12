@@ -11,6 +11,7 @@
 //! lower bound on resident memory, not an exact accounting.
 
 use std::collections::{BTreeMap, btree_map};
+use std::ops::Bound;
 
 use crate::record::Record;
 
@@ -74,6 +75,12 @@ impl MemTable {
         self.approx_size
     }
 
+    /// How many records the buffer holds.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Whether the buffer holds no records at all.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -84,6 +91,29 @@ impl MemTable {
     #[inline]
     pub(crate) fn iter(&self) -> btree_map::Iter<'_, Vec<u8>, Record> {
         self.entries.iter()
+    }
+
+    /// Iterate the buffered records within `(start, end)`, in ascending key
+    /// order, by seeking: the cost is the records in the range, not the
+    /// records before it. A range whose start lies past its end is empty
+    /// (`BTreeMap::range` would panic on it).
+    pub(crate) fn range<'a>(
+        &'a self,
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+    ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Record)> + 'a {
+        let empty = match (start, end) {
+            (Bound::Included(s), Bound::Included(e)) => s > e,
+            (Bound::Included(s) | Bound::Excluded(s), Bound::Excluded(e))
+            | (Bound::Excluded(s), Bound::Included(e)) => s >= e,
+            _ => false,
+        };
+        let range = if empty {
+            None
+        } else {
+            Some(self.entries.range::<[u8], _>((start, end)))
+        };
+        range.into_iter().flatten()
     }
 
     /// Replace the buffer with an empty one and return the old contents,
