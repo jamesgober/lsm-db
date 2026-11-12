@@ -10,7 +10,7 @@
 //! underpins so many write-heavy stores.
 //!
 //! `lsm-db` packages that write path as a small, audited library so the storage
-//! engines in the portfolio — `txn-db`, Hive DB — share one implementation
+//! engines in the portfolio (such as `txn-db`) share one implementation
 //! rather than each re-deriving it.
 //!
 //! ## The Tier-1 API

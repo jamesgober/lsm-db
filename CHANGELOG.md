@@ -565,7 +565,6 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `REPS.md` compliance baseline at the repository root.
 - `.github/workflows/ci.yml` &mdash; Linux/macOS/Windows CI matrix on stable and MSRV, plus loom and audit/deny jobs.
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
 [Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.4.1...HEAD
 [1.4.1]: https://github.com/jamesgober/lsm-db/compare/v1.4.0...v1.4.1
