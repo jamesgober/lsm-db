@@ -37,7 +37,7 @@ their run and rebuilt when they fail. No change without `bloom`.
 
 ## [1.4.0] - 2026-11-12
 
-Fixes from an independent review: an open no longer loses or overwrites data
+An open no longer loses or overwrites data
 it cannot account for, and the run footer, the write-ahead log, and the bloom
 sidecar are checked before they are trusted. The format version is unchanged:
 1.0 to 1.3 read the runs 1.4 writes, and 1.4 opens every existing store.
