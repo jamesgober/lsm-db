@@ -290,7 +290,26 @@ impl Lsm {
                 }
                 Err(err) => return Err(err),
             };
-            table.attach_filter(RunFilter::load(&path)?);
+            // A filter that fails its checks, or answers "absent" for a key
+            // the run's index names (a sidecar hashed another way), is
+            // dropped and rebuilt from the run.
+            let filter = match RunFilter::load(&path)? {
+                bloom::Sidecar::Loaded(filter) if table.filter_covers_index(&filter) => {
+                    Some(filter)
+                }
+                bloom::Sidecar::Loaded(_) | bloom::Sidecar::Rejected => {
+                    let _ = std::fs::remove_file(bloom::sidecar_path(&path));
+                    let rebuilt = table.rebuild_filter();
+                    if let Some(filter) = &rebuilt {
+                        // A sidecar that cannot be written is rebuilt again
+                        // at the next open; the filter in memory serves now.
+                        let _ = filter.write_sidecar(&path);
+                    }
+                    rebuilt
+                }
+                bloom::Sidecar::Absent => None,
+            };
+            table.attach_filter(filter);
             table.attach_cache(Arc::clone(&cache));
             runs.push(Arc::new(table));
         }

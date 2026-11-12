@@ -213,6 +213,31 @@ impl SsTable {
         self.cache = Some(cache);
     }
 
+    /// Whether `filter` answers "maybe" for the last key of every block this
+    /// run's index names: a filter built over other keys, or hashed another
+    /// way, almost surely does not. One pass over the index, no I/O.
+    pub(crate) fn filter_covers_index(&self, filter: &RunFilter) -> bool {
+        self.index
+            .iter()
+            .all(|block| filter.might_contain(&block.last_key))
+    }
+
+    /// A filter rebuilt from this run's keys, read once: for a run whose
+    /// sidecar was rejected. `None` when the run cannot be read whole or the
+    /// filter cannot be sized (the run is then consulted directly).
+    pub(crate) fn rebuild_filter(&self) -> Option<RunFilter> {
+        let capacity = usize::try_from(self.entry_count()).ok()?;
+        let mut builder = bloom::builder(capacity);
+        let mut cursor = self.cursor();
+        while let Some((key, _)) = cursor.next_entry() {
+            builder.add(&key);
+        }
+        if cursor.take_error().is_some() {
+            return None;
+        }
+        builder.finish()
+    }
+
     /// Whether this run might contain `key`, per its bloom filter. Returns
     /// `true` (consult the run) when there is no filter.
     #[inline]

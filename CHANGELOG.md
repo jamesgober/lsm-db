@@ -18,6 +18,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.4.1] - 2026-11-12
+
+bloom-lib 1.1 for the `bloom` feature, and sidecars that are checked against
+their run and rebuilt when they fail. No change without `bloom`.
+
+### Changed
+
+- bloom-lib 1.1 (was pinned at 1.0.0): it hashes little-endian with 64-bit lengths on every target, and its decoding validates. On x86_64 and other 64-bit little-endian hosts its hashes and bytes are those of 1.0, so every existing sidecar stays valid; the golden sidecar test confirms identical bytes. The requirement is now `~1.1`, as bloom-lib promises fixed hashes and bytes for the rest of 1.x.
+
+### Fixed
+
+- **A well-formed sidecar built over other keys made point reads miss keys the run holds.** A sidecar bloom-lib 1.0 wrote on a 32-bit or big-endian host is one (its hashes differ), as is one copied from another run. At open a filter must now answer "maybe" for the last key of every block in its run's index; one that does not is dropped.
+- **A sidecar that failed its checks left its run without a filter** until the run was compacted away. A dropped sidecar is now rebuilt from its run at open (one read of the run) and written again.
+
+---
+
 ## [1.4.0] - 2026-11-12
 
 Fixes from an independent review: an open no longer loses or overwrites data
@@ -550,7 +566,8 @@ Initial scaffold and repository bootstrap. No lsm-db logic yet &mdash; this rele
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsm-db/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/jamesgober/lsm-db/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/jamesgober/lsm-db/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/jamesgober/lsm-db/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/jamesgober/lsm-db/compare/v1.2.0...v1.2.1

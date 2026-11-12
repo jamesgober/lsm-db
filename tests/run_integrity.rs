@@ -6,7 +6,9 @@
 //! - The header magic is checked.
 //! - A run whose blocks overlap (each block with a valid checksum) is
 //!   corruption, not a stream of keys out of order.
-//! - A bloom sidecar with a valid checksum but an unsound filter is dropped.
+//! - A bloom sidecar with a valid checksum but an unsound filter is dropped,
+//!   and so is a sound one that answers "absent" for a key the run's index
+//!   names; either is rebuilt from the run (since 1.4.1).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -37,9 +39,14 @@ fn run_files(dir: &Path) -> Vec<PathBuf> {
 
 /// A store in `dir` with one flushed run of a few keys; returns the run's path.
 fn one_run(dir: &Path) -> PathBuf {
+    run_of(dir, "key")
+}
+
+/// A store in `dir` with one flushed run of 50 keys starting `prefix`.
+fn run_of(dir: &Path, prefix: &str) -> PathBuf {
     let db = Lsm::open_with(dir, LsmConfig::new().compaction_trigger(usize::MAX)).unwrap();
     for i in 0..50u32 {
-        db.put(format!("key{i:03}"), [b'v'; 20]).unwrap();
+        db.put(format!("{prefix}{i:03}"), [b'v'; 20]).unwrap();
     }
     db.flush().unwrap();
     drop(db);
@@ -232,4 +239,61 @@ fn a_crafted_bloom_sidecar_is_dropped_not_trusted() {
     let db = Lsm::open(dir.path()).unwrap();
     assert_eq!(db.get(b"key001").unwrap(), Some(vec![b'v'; 20]));
     assert_eq!(db.get(b"absent").unwrap(), None);
+}
+
+#[cfg(feature = "bloom")]
+fn sidecar_of(run: &Path) -> PathBuf {
+    let mut path = run.as_os_str().to_os_string();
+    path.push(".bloom");
+    PathBuf::from(path)
+}
+
+/// Before 1.4.1 a well-formed sidecar built over other keys (which is what a
+/// sidecar bloom-lib 1.0 hashed on a 32-bit or big-endian host looks like on
+/// any other) was trusted, so point reads missed keys the run holds. Now it
+/// fails the check against the run's index at open and is rebuilt.
+#[cfg(feature = "bloom")]
+#[test]
+fn a_sidecar_built_over_other_keys_is_rebuilt() {
+    let ours = tempfile::tempdir().unwrap();
+    let theirs = tempfile::tempdir().unwrap();
+    let run = run_of(ours.path(), "key");
+    let other = run_of(theirs.path(), "other");
+    let planted = fs::read(sidecar_of(&other)).unwrap();
+    fs::write(sidecar_of(&run), &planted).unwrap();
+
+    let db = Lsm::open(ours.path()).unwrap();
+    for i in 0..50u32 {
+        assert_eq!(
+            db.get(format!("key{i:03}")).unwrap(),
+            Some(vec![b'v'; 20]),
+            "key{i:03}"
+        );
+    }
+    drop(db);
+    let rebuilt = fs::read(sidecar_of(&run)).unwrap();
+    assert_ne!(rebuilt, planted, "the sidecar was written again");
+    assert_eq!(&rebuilt[..8], b"LSMBLM01");
+}
+
+/// Before 1.4.1 a sidecar that failed its checks was removed and the run
+/// read without a filter until it was compacted away. Now the filter is
+/// rebuilt at open and its sidecar written again.
+#[cfg(feature = "bloom")]
+#[test]
+fn a_rejected_sidecar_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = one_run(dir.path());
+    let good = fs::read(sidecar_of(&run)).unwrap();
+    fs::write(sidecar_of(&run), b"not a filter").unwrap();
+
+    let db = Lsm::open(dir.path()).unwrap();
+    assert_eq!(db.get(b"key007").unwrap(), Some(vec![b'v'; 20]));
+    assert_eq!(db.get(b"absent").unwrap(), None);
+    drop(db);
+    assert_eq!(
+        fs::read(sidecar_of(&run)).unwrap(),
+        good,
+        "rebuilt to the same bytes as the one the flush wrote"
+    );
 }
