@@ -164,6 +164,8 @@ mod db;
 #[cfg(feature = "std")]
 mod durability;
 mod error;
+#[cfg(feature = "std")]
+mod fault;
 pub mod format;
 #[cfg(feature = "std")]
 mod manifest;

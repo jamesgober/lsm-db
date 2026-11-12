@@ -75,6 +75,12 @@ impl MemTable {
         self.approx_size
     }
 
+    /// How many records the buffer holds.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Whether the buffer holds no records at all.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -82,7 +88,6 @@ impl MemTable {
     }
 
     /// Iterate the buffered records in ascending key order.
-    #[cfg(test)]
     #[inline]
     pub(crate) fn iter(&self) -> btree_map::Iter<'_, Vec<u8>, Record> {
         self.entries.iter()
