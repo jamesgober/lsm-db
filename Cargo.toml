@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lsm-db"
-version = "1.4.0"
+version = "1.4.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -99,10 +99,11 @@ error-forge = { version = "1.1", optional = true, default-features = false }
 wal-db    = { version = "1.4", optional = true, default-features = false }
 # `serde` so a built filter can be persisted to / loaded from its sidecar; the
 # default hasher is fixed-seed, so a reloaded filter answers identically.
-# Pinned: the sidecar bytes are frozen for 1.x, and bloom-lib promises no
-# stable byte layout until its versioned format (planned for its 2.0). The
-# golden test in `src/bloom.rs` fails on any change.
-bloom-lib = { version = "=1.0.0", optional = true, default-features = false, features = ["std", "serde"] }
+# 1.1: hashing fixed little-endian with 64-bit lengths on every target (1.0
+# hashed by the CPU's byte order and pointer size), deserializing validates,
+# and the hashes and serialized bytes are promised fixed for the rest of 1.x.
+# The golden test in `src/bloom.rs` still fails on any change.
+bloom-lib = { version = "~1.1", optional = true, default-features = false, features = ["std", "serde"] }
 
 # Compact, no_std, serde-based codec for the bloom-filter sidecar files. Pulled
 # only by the `bloom` feature. Held to 1.1 patch releases for the same reason;

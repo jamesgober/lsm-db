@@ -42,6 +42,13 @@ pub(crate) const LOCK_FILE: &str = "LOCK";
 /// Context of the error a held directory returns.
 const HELD: &str = "lock database directory (another handle has it open)";
 
+/// How long a held lock is tried again before it is reported held. A
+/// process that starts a child holds a copy of each open file until the
+/// child runs its program, and an advisory lock belongs to the open file, so
+/// a handle dropped at that moment keeps its lock a little longer; a reopen
+/// right after (in this process) waits that out instead of failing.
+const HELD_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Exclusive ownership of a database directory, released on drop.
 #[derive(Debug)]
 pub(crate) struct DirLock {
@@ -60,7 +67,18 @@ impl DirLock {
     /// cannot be opened or written.
     pub(crate) fn acquire(dir: &Path) -> Result<DirLock> {
         let path = dir.join(LOCK_FILE);
-        let file = lock_file(&path)?;
+        let started = std::time::Instant::now();
+        let file = loop {
+            match lock_file(&path) {
+                Err(Error::Io { source, .. })
+                    if source.kind() == io::ErrorKind::WouldBlock
+                        && started.elapsed() < HELD_WAIT =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => break other?,
+            }
+        };
         Ok(DirLock {
             _file: file,
             #[cfg(all(not(lsm_file_lock), unix))]
@@ -212,6 +230,25 @@ mod tests {
         drop(first);
         let again = DirLock::acquire(dir.path()).unwrap();
         drop(again);
+    }
+
+    /// Before 1.4.1 a lock still held through a copy of its file (a child
+    /// process between its start and its program, which holds a copy of
+    /// every open file) made a reopen right after a drop fail as "held".
+    #[cfg(all(lsm_file_lock, unix))]
+    #[test]
+    fn test_a_lock_held_a_moment_longer_by_a_copy_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DirLock::acquire(dir.path()).unwrap();
+        let copy = first._file.try_clone().unwrap();
+        drop(first);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(copy);
+        });
+        let again = DirLock::acquire(dir.path());
+        release.join().unwrap();
+        assert!(again.is_ok(), "{again:?}");
     }
 
     #[test]

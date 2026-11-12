@@ -17,7 +17,7 @@
 > Complete reference for every public item in `lsm-db`, with parameter notes and
 > runnable examples.
 >
-> **Status: `1.4.0`, stable. API frozen until 2.0.** The surface below is frozen
+> **Status: `1.4.1`, stable. API frozen until 2.0.** The surface below is frozen
 > — no breaking change — over a multi-run engine with background compaction, a
 > block cache, optional crash-safe writes (`durability`), and optional
 > bloom-filtered point reads (`bloom`). The on-disk format is frozen for the 1.x
@@ -1116,10 +1116,13 @@ with identical results.
 A sidecar's CRC32C detects damage; it is not authentication, since anyone who
 can write the file can compute it. Since 1.4 the decoded filter's shape is
 checked too (bit count, word count, and hash count agree and are in range), so a
-crafted sidecar cannot make a lookup panic or hash without bound. A well-formed
-filter built over other keys can still make point reads miss keys the run holds
-(scans are not affected). Keep the database directory writable only by its
-owner.
+crafted sidecar cannot make a lookup panic or hash without bound. Since 1.4.1 a
+filter must also answer "maybe" for the last key of every block in its run's
+index, which a filter built over other keys (or one bloom-lib 1.0 hashed on a
+32-bit or big-endian host) almost surely does not; and a sidecar that fails any
+check is rebuilt from its run at open, and written again. A filter forged to pass
+the index check can still make point reads miss other keys the run holds (scans
+are not affected). Keep the database directory writable only by its owner.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -17,11 +17,15 @@
 //! A sidecar is checked, not trusted. Its CRC32C detects damage, but anyone
 //! who can write the file can also compute the checksum, so the decoded
 //! filter's shape is checked as well (its bit count, word count, and hash
-//! count agree and are in range) and a filter that fails is dropped. What no
-//! check can catch is a well-formed filter built over other keys: it makes
-//! point reads miss keys that the run holds (scans still find them). The
-//! sidecar has no key; keep the database directory writable only by its
-//! owner.
+//! count agree and are in range) and a filter that fails is dropped. A
+//! well-formed filter built over other keys (or hashed another way, as
+//! bloom-lib 1.0 did on 32-bit and big-endian hosts) would make point reads
+//! miss keys the run holds, so at open a filter must also answer "maybe" for
+//! the last key of every block the run's index names; one that does not is
+//! dropped too. A dropped filter is rebuilt from its run and its sidecar
+//! written again (since 1.4.1). A filter forged to pass that check can still
+//! hide other keys from point reads (scans still find them): the sidecar has
+//! no key, so keep the database directory writable only by its owner.
 //!
 //! Everything here presents the same surface whether or not the `bloom` feature
 //! is enabled; with it off, [`RunFilter`] is a zero-sized no-op the engine calls
@@ -45,6 +49,19 @@ pub(crate) fn sidecar_tmp_path(run_path: &Path) -> PathBuf {
     let mut name = sidecar_path(run_path).into_os_string();
     name.push(".tmp");
     PathBuf::from(name)
+}
+
+/// What a run's sidecar held at open.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "bloom"), allow(dead_code))]
+pub(crate) enum Sidecar {
+    /// No sidecar: the run is consulted directly, as without the feature.
+    Absent,
+    /// A sidecar that failed its checks: it was removed, and the filter is
+    /// rebuilt from the run.
+    Rejected,
+    /// A sound filter.
+    Loaded(RunFilter),
 }
 
 #[cfg(feature = "bloom")]
@@ -85,8 +102,8 @@ mod disabled {
 
     impl RunFilter {
         #[inline]
-        pub(crate) fn load(_run_path: &Path) -> Result<Option<RunFilter>> {
-            Ok(None)
+        pub(crate) fn load(_run_path: &Path) -> Result<super::Sidecar> {
+            Ok(super::Sidecar::Absent)
         }
 
         #[inline]
@@ -108,7 +125,7 @@ mod enabled {
 
     use bloom_lib::BloomFilter;
 
-    use super::{sidecar_path, sidecar_tmp_path};
+    use super::{Sidecar, sidecar_path, sidecar_tmp_path};
     use crate::error::{Error, Result};
 
     /// Target false-positive rate for a run filter. 1% keeps the filter small
@@ -194,9 +211,10 @@ mod enabled {
     impl RunFilter {
         /// Load the filter for the run at `run_path` from its sidecar.
         ///
-        /// Returns `Ok(None)` when the sidecar is absent or fails its checks:
-        /// both are non-fatal, and the run is simply consulted directly. A
-        /// genuine I/O failure (for example a permission error) is propagated.
+        /// A sidecar that is absent or fails its checks is non-fatal: the
+        /// first leaves the run without a filter, the second is removed so
+        /// the caller rebuilds it. A genuine I/O failure (for example a
+        /// permission error) is propagated.
         ///
         /// The envelope (magic + CRC32C over the payload) detects damage; it
         /// is not a security boundary, because anyone who can write the file
@@ -204,19 +222,19 @@ mod enabled {
         /// is decoded and checked after: the word count matches the bit count
         /// and the hash count is in range, which is what makes a query of the
         /// filter safe (no index outside its bits, no unbounded hashing).
-        pub(crate) fn load(run_path: &Path) -> Result<Option<RunFilter>> {
+        pub(crate) fn load(run_path: &Path) -> Result<Sidecar> {
             let path = sidecar_path(run_path);
             let bytes = match fs::read(&path) {
                 Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Sidecar::Absent),
                 Err(e) => return Err(Error::io("read bloom sidecar", e)),
             };
             match Self::decode(&bytes) {
-                Some(filter) => Ok(Some(RunFilter { filter })),
+                Some(filter) => Ok(Sidecar::Loaded(RunFilter { filter })),
                 // A corrupt sidecar is a discardable hint, not data loss.
                 None => {
                     let _ = fs::remove_file(&path);
-                    Ok(None)
+                    Ok(Sidecar::Rejected)
                 }
             }
         }
@@ -526,7 +544,9 @@ mod enabled {
             f.write_sidecar(&run).unwrap();
             assert!(sidecar_path(&run).exists());
 
-            let loaded = RunFilter::load(&run).unwrap().expect("sidecar present");
+            let super::super::Sidecar::Loaded(loaded) = RunFilter::load(&run).unwrap() else {
+                panic!("sidecar present");
+            };
             assert!(loaded.might_contain(b"one"));
             assert!(loaded.might_contain(b"three"));
         }
@@ -535,7 +555,10 @@ mod enabled {
         fn test_load_missing_sidecar_is_none() {
             let dir = tempfile::tempdir().unwrap();
             let run = dir.path().join("run.sst");
-            assert!(RunFilter::load(&run).unwrap().is_none());
+            assert!(matches!(
+                RunFilter::load(&run).unwrap(),
+                super::super::Sidecar::Absent
+            ));
         }
 
         #[test]
@@ -543,7 +566,10 @@ mod enabled {
             let dir = tempfile::tempdir().unwrap();
             let run = dir.path().join("run.sst");
             std::fs::write(sidecar_path(&run), b"not a valid filter").unwrap();
-            assert!(RunFilter::load(&run).unwrap().is_none());
+            assert!(matches!(
+                RunFilter::load(&run).unwrap(),
+                super::super::Sidecar::Rejected
+            ));
             assert!(
                 !sidecar_path(&run).exists(),
                 "corrupt sidecar should be removed"
