@@ -22,7 +22,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Log-structured merge-tree storage engine for Rust. Memtable, sorted runs merged by background compaction, a block cache, optional bloom-filtered point reads, and an optional wal-db write-ahead log. A composable storage engine for embedded databases and Hive DB."
+description = "Log-structured merge-tree storage engine for Rust. Memtable, sorted runs merged by background compaction, a block cache, optional bloom-filtered point reads, and an optional wal-db write-ahead log. A composable storage engine for embedded databases."
 
 # Keywords (5 max)
 keywords = [

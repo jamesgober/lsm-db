@@ -139,7 +139,6 @@ Compaction merges **every** live run into one, each time the run count reaches t
 
 - [`wal-db`](https://github.com/jamesgober/wal-db) &mdash; memtable durability and crash recovery
 - [`bloom-lib`](https://github.com/jamesgober/bloom-lib) &mdash; SSTable point-read filtering
-- Hive DB &mdash; a candidate storage engine behind the `StorageEngine` trait
 
 It stays foreign-compatible: usable standalone as an embedded key-value store.
 
